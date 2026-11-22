@@ -66,7 +66,19 @@ pub fn startup_sec(total_sec: i64) -> i64 {
         return 0;
     }
     let ratio = (total_sec as f64 * STARTUP_RATIO).round() as i64;
-    ratio.min(STARTUP_SEC).clamp(5, total_sec / 2)
+    // 默认沿用上游的比例外推（零行为变更）；只有显式设了
+    // `PACE_STARTUP_CAP_SEC` 才封顶。我们的默认启动脚本会设成 86。
+    //
+    // 为什么要封顶：真机样本是 555 秒→86 秒。按 15.5% 外推到 20 分钟记录
+    // 会切出 186 秒，那 3 分钟速度≈0、逐点配速 30~90 分/公里，对
+    // 「4'00"~12'00"」这类规则整段越界——2026-11-18 那条被驳回的记录
+    // 就是在这个版本上发出的。
+    let cap = std::env::var("PACE_STARTUP_CAP_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(i64::MAX);
+    ratio.min(cap).clamp(5, total_sec / 2)
 }
 
 /// 起步窗口吃掉的里程占全程的比例。
@@ -1475,6 +1487,61 @@ pub fn queue_num(pos: usize, n: usize, startup: usize) -> i32 {
     (1 + (pos - startup) / step).min(24) as i32
 }
 
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// 本地诊断（issue #4）：起步窗口在 555 / 1200 / 1800 秒三个时长下的
+    /// 数学结果，不用账号、不提交。调窗口口径前先看这张表，别拿真机试。
+    ///
+    /// `cargo test --release startup_window_table -- --nocapture` 可以把表打出来。
+    #[test]
+    fn startup_window_table() {
+        for total in [555i64, 1200, 1800] {
+            let w = startup_sec(total);
+            // 上报节奏 5 秒/点，窗口内的点数就是零速度点数
+            let pts = w / 5;
+            println!(
+                "总时长 {total}s → 窗口 {w}s（{:.1}%），约 {pts} 个零速度点",
+                w as f64 / total as f64 * 100.0
+            );
+            assert!(w >= 5 && w <= total / 2, "窗口越界: {w}");
+        }
+        // 按 15.5% 外推的实际取值，锁住当前口径；改口径时这条会先红
+        assert_eq!(startup_sec(555), 86);
+        assert_eq!(startup_sec(1200), 186);
+        assert_eq!(startup_sec(1800), 279);
+    }
+
+    /// 同一张诊断表的扩展版（issue #4 第 3 问）：除了窗口时长和零速度点数，
+    /// 再给起步窗口的里程预算、首段配速，以及出窗后的正常配速——调窗口口径
+    /// 时看的是这几个数会不会产生「首段配速 80 分/公里」这种一眼假的东西。
+    ///
+    /// 里程按参考配速 6'00"/km 折算，只用于比较趋势，不是校准值。
+    /// `cargo test --release startup_window_budget_table -- --nocapture`
+    #[test]
+    fn startup_window_budget_table() {
+        const REF_PACE_SEC_PER_KM: f64 = 360.0;
+        for total in [555i64, 1200, 1800] {
+            let w = startup_sec(total);
+            let pts = (0..=total).step_by(5).filter(|t| *t < w).count();
+            let total_m = total as f64 / REF_PACE_SEC_PER_KM * 1000.0;
+            let startup_m = total_m * STARTUP_DIST_RATIO;
+            // 首段配速：窗口秒数 ÷ 窗口里程（分/公里）
+            let first_pace_min = (w as f64 / 60.0) / (startup_m / 1000.0);
+            // 出窗后的正常配速：剩余秒数 ÷ 剩余里程
+            let rest_pace_min =
+                ((total - w) as f64 / 60.0) / ((total_m - startup_m) / 1000.0);
+            let tag = if total == 555 { "实测样本时长" } else { "外推，无样本" };
+            println!(
+                "总时长 {total}s（{tag}）→ 窗口 {w}s / {pts} 个零速度点 / 里程预算 {startup_m:.0}m / 首段 {first_pace_min:.0}'/km，出窗后 {rest_pace_min:.2}'/km",
+            );
+            assert!(startup_m > 0.0 && first_pace_min > rest_pace_min);
+        }
+    }
+}
+
 #[cfg(test)]
 mod nudge_tests {
     use super::*;
@@ -1484,7 +1551,7 @@ mod nudge_tests {
     /// 就是这种量级——不是几十米的大直角。
     fn bent_shape() -> Vec<(f64, f64)> {
         let lat0: f64 = 38.9000;
-        let lon0 = 121.5000;
+        let lon0 = 101.5000;
         let mlat = 1.0 / 110_540.0; // 1m 的纬度
         let mlon = 1.0 / (111_320.0 * lat0.to_radians().cos());
         let mut dense = Vec::new();
@@ -1740,11 +1807,11 @@ mod checkpoint_hit_tests {
 
     fn official_cps() -> Vec<(f64, f64)> {
         vec![
-            (47.385718, 123.956956),
-            (47.386792, 123.959479),
-            (47.384723, 123.956519),
-            (47.386375, 123.958661),
-            (47.385626, 123.955836),
+            (47.385718, 103.956956),
+            (47.386792, 103.959479),
+            (47.384723, 103.956519),
+            (47.386375, 103.958661),
+            (47.385626, 103.955836),
         ]
     }
 
@@ -1773,7 +1840,7 @@ mod checkpoint_hit_tests {
     ) -> Result<(Vec<TrackPoint>, i64, SnapReport), String> {
         let req = PlanRequest {
             center_lat: 47.3801,
-            center_lng: 123.9521,
+            center_lng: 103.9521,
             checkpoints: as_checkpoints(cps),
             total_distance_m: dist,
             total_sec: dur,
@@ -2423,7 +2490,7 @@ mod sample_rate_tests {
             heading: 0.3,
             laps: 4.723,
         };
-        stadium::campus_oval_track((47.3794, 123.9502), &spec, 5.0, 2026)
+        stadium::campus_oval_track((47.3794, 103.9502), &spec, 5.0, 2026)
     }
 
     /// 走一遍生产链路的那一段：等时间采样 → 起步压平。

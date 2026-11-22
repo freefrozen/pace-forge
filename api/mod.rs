@@ -1,12 +1,15 @@
 //! 业务接口层。
 
 pub mod accounts;
+pub mod audit;
 pub mod egress;
 pub mod start_time;
 pub mod client;
 pub mod cheat;
 pub mod coord;
 pub mod elev;
+pub mod device_table;
+pub mod crosscheck;
 pub mod fence;
 pub mod obs;
 pub mod points;

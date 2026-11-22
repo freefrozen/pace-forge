@@ -73,6 +73,14 @@ pub struct RunParams {
     /// 用户清楚哪栋楼在哪，手画比算法猜靠谱——尤其 OSM 在该校区
     /// 零建筑数据、几何规划只能凭直线连点的时候。
     pub custom_path: Option<Vec<(f64, f64)>>,
+    /// 是否尝试「按打卡点反推操场」。
+    ///
+    /// 控制台有「自动规划 / 操场绕圈」两个选项，这里必须如实反映用户选的那个：
+    /// 早先只判 `run_mode == 1`，于是选了「自动规划」也会被拿去试操场，打卡点
+    /// 恰好围成长方形就被判成跑道，画出一条不在任何跑道上的椭圆——用户的
+    /// 选择被静默改写，界面还显示「操场绕圈」。CLI 没有这个选项，默认 `true`
+    /// 保持原来的自动尝试行为。
+    pub prefer_stadium: bool,
     /// 海拔区间 `(最低, 最高)`，米。`None` 用默认 42±21m。
     pub alt_range: Option<(f64, f64)>,
 }
@@ -92,6 +100,15 @@ pub struct RunParams {
 /// 路线规划。fork 那边无条件绕圈是因为他的账号打卡点全在操场周围（外框
 /// 几十米）；校园各处的打卡点（跨度几百米）硬套会让轨迹飞到不知道哪里，
 /// 必须能识别出来。
+/// 是否尝试按打卡点反推操场。
+///
+/// 两个条件缺一不可：记分跑（`run_mode == 1`）且用户选的是「操场绕圈」。
+/// 只判前者会把「自动规划」也翻成操场——打卡点凑成矩形就会被几何判据当成
+/// 跑道，在不是操场的地方画椭圆（用户看到的「我选了自由路线，怎么绕操场」）。
+fn should_try_stadium(run_mode: i64, prefer_stadium: bool) -> bool {
+    run_mode == 1 && prefer_stadium
+}
+
 fn try_stadium_track(
     cps: &[Checkpoint],
     distance_m: f64,
@@ -332,6 +349,8 @@ fn try_route_on_roads(
 ) -> Option<crate::track::fence_route::FenceRoute> {
     use crate::track::roadnet;
     let bbox = roadnet::bbox_of(fence, 80.0);
+    log("[roads] 拉 OSM 路网…（单端点 10 秒超时）");
+    let t0 = std::time::Instant::now();
     let net = match roadnet::fetch(bbox) {
         Ok(n) => n,
         Err(e) => {
@@ -347,7 +366,10 @@ fn try_route_on_roads(
         ));
         return None;
     }
-    log(&format!("[roads] 路网 {total:.0}m，按真实道路规划"));
+    log(&format!(
+        "[roads] 路网 {total:.0}m（用时 {:.1}s），按真实道路规划",
+        t0.elapsed().as_secs_f64()
+    ));
     let start = must.first().copied().unwrap_or(fence[0]);
     match roadnet::route_on_roads(&clipped, start, must, want_m, seed) {
         Ok(r) => {
@@ -396,6 +418,7 @@ fn try_route_on_tiles(
 ) -> Option<crate::track::fence_route::FenceRoute> {
     use crate::track::{roadnet, tileroad};
     let bbox = roadnet::bbox_of(fence, 60.0);
+    log("[tiles] 拉高德瓦片路网…");
     let net = match tileroad::fetch_roadnet(bbox) {
         Ok(n) => n,
         Err(e) => {
@@ -605,6 +628,7 @@ impl Default for RunParams {
             start_at_ms: None,
             custom_path: None,
             alt_range: None,
+            prefer_stadium: true,
         }
     }
 }
@@ -681,6 +705,10 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 校时：之后所有时间戳都必须落在服务器时间轴上。
     // 「开始时间 + 时长 ≤ 服务器现在」是服务端硬判据，本机时钟偏十几分钟
     // 就直接驳回，而本地自检用同一个时钟，永远发现不了这个偏差。
+    // 阶段计时：每一步都报耗时，卡住时日志里能直接看出卡在哪一段。
+    let dry_t0 = std::time::Instant::now();
+    let mut stage_t = dry_t0;
+
     let (server_now, skew) = super::gmttime::server_now_ms(client);
     match skew {
         Some(off) if off.abs() >= 1000 => log(&format!(
@@ -771,6 +799,9 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         Err(e) => return Err(e),
     };
 
+    log(&format!("[耗时] 校时+策略 {:.1}s", stage_t.elapsed().as_secs_f64()));
+    stage_t = std::time::Instant::now();
+
     // ② fence
     log("[fence] 拉取围栏…");
     let pick = match fence::fetch_fences(client) {
@@ -803,10 +834,22 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             None
         }
         Err(e) => {
+            // 计分跑必须知道自己学校的围栏才谈得上「围栏内计分」。接口失败时
+            // 静默按自由跑提交，结果是服务端按自由跑处理、用户白烧一次额度，
+            // 还看不到哪一步降级了（issue #8）。这里只拦「拿不到」，学校确实
+            // 没配围栏是 `Ok(空)`，仍按原行为继续。
+            if p.run_mode == 1 {
+                return Err(format!(
+                    "计分跑必须拿到官方围栏，但接口失败：{e}\n                     这不是重试能绕过的问题——先确认登录态和校区选择，再重新生成"
+                ));
+            }
             log(&format!("⚠ [fence] 接口失败，按自由跑继续: {e}"));
             None
         }
     };
+
+    log(&format!("[耗时] 围栏 {:.1}s", stage_t.elapsed().as_secs_f64()));
+    stage_t = std::time::Instant::now();
 
     // ③ points
     log("[points] 拉取打卡点…");
@@ -869,6 +912,9 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         }
     };
 
+    log(&format!("[耗时] 打卡点 {:.1}s", stage_t.elapsed().as_secs_f64()));
+    stage_t = std::time::Instant::now();
+
     // ④ 规划
     let cps: Vec<Checkpoint> = pt
         .coords
@@ -916,8 +962,12 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 各处），自动回退到下面的路线规划——不是所有学校都绕操场跑。
     // 请求了操场却没成，必须让界面知道（`stadium_fallback`），否则用户以为
     // 自己跑的是标准跑道，实际走的是绕楼路线。
+    //
+    // 只有用户**明确选了操场**才试（`prefer_stadium`）。选「自动规划」时
+    // 不走这条：打卡点围成长方形是常见布局（教学楼四角、宿舍区），几何判据
+    // 会把它认成跑道，然后在不是操场的地方画椭圆。
     let mut stadium_fallback = false;
-    let oval: Option<Vec<(f64, f64)>> = if p.run_mode == 1 {
+    let oval: Option<Vec<(f64, f64)>> = if should_try_stadium(p.run_mode, p.prefer_stadium) {
         let seed0 = if p.seed != 0 { p.seed } else { start_ms as u64 };
         let got = try_stadium_track(&cps, p.distance_m, p.sample_step_m, seed0, log);
         stadium_fallback = got.is_none();
@@ -1070,8 +1120,27 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         // 几何规划——不能因为查不到路网就不跑了。
         // 障碍轮廓：建筑 + 水体。路线生成完后再避让，不能让轨迹从楼里穿过。
         // 数据源是 Overpass（30 天缓存），拉不到就跳过，不阻断跑单。
-        let blockers: Vec<Vec<(f64, f64)>> = {
+        // 纯几何模式（`prefer_roads=false`）：网络连不上 OSM / 瓦片时，
+        // 这一步要白等三次超时才拿不到任何东西。用户明确不要路网，就只读
+        // 本地标注禁区，形状与「Overpass 失败后」完全一致。
+        let blockers: Vec<Vec<(f64, f64)>> = if !p.prefer_roads {
+            log("[block] 纯几何模式：跳过 OSM 建筑/水体查询");
+            let local = crate::track::roadnet::load_local_blockers();
+            let v: Vec<Vec<(f64, f64)>> = local
+                .iter()
+                .map(|poly| {
+                    poly.iter()
+                        .map(|&(la, ln)| crate::api::coord::gcj02_to_bd09(la, ln))
+                        .collect()
+                })
+                .collect();
+            if !v.is_empty() {
+                log(&format!("[block] 本地标注禁区 {} 块", v.len()));
+            }
+            v
+        } else {
             let bbox = crate::track::roadnet::bbox_of(&fence_ring, 60.0);
+            log("[block] 查 OSM 建筑/水体轮廓…");
             let mut v: Vec<Vec<(f64, f64)>> = Vec::new();
             // **三套坐标系必须归一到 BD-09 才能放进同一个几何判断。**
             // 这里原来是直接 `v.extend(...)`，把三种坐标混在一个平面上：
@@ -1110,6 +1179,12 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             v
         };
 
+        log(&format!(
+            "[耗时] 建筑/水体 {:.1}s",
+            stage_t.elapsed().as_secs_f64()
+        ));
+        stage_t = std::time::Instant::now();
+
         // 路网来源两级：OSM 优先（有真实道路等级和拓扑），拿不到再试高德
         // 瓦片。两级都失败才退回几何规划。
         let on_roads = if p.prefer_roads {
@@ -1120,6 +1195,9 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         } else {
             None
         };
+        log(&format!("[耗时] 拉路网 {:.1}s", stage_t.elapsed().as_secs_f64()));
+        stage_t = std::time::Instant::now();
+
         let route = if let Some(r) = on_roads {
             r
         } else if must.len() >= 2 {
@@ -1267,6 +1345,9 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         p.distance_m,
         (track.actual_length_m - p.distance_m).abs() / p.distance_m * 100.0
     ));
+
+    log(&format!("[耗时] 规划 {:.1}s", stage_t.elapsed().as_secs_f64()));
+    stage_t = std::time::Instant::now();
 
     // ⑤ 上报采样：**等时间** 5 秒（真机节奏），几何仍走密采样。
     //
@@ -1536,6 +1617,16 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     )
     .round() as i64;
 
+    // 长度漂移诊断：目标里程 vs 几何压缩/吸附后的实测里程。两者差得远
+    // （粗采样、急剧转弯、被禁区推挤）时，报文里的 totalDis 就会和表单
+    // 上填的公里数对不上，先在这一行里看见，不用等提交后回看。
+    {
+        let drift = (real_len as f64 - p.distance_m) / p.distance_m.max(1.0) * 100.0;
+        log(&format!(
+            "[length] 目标 {:.0}m → 实测 {real_len}m（{:+.1}%）",
+            p.distance_m, drift
+        ));
+    }
     let timed: Vec<(f64, f64, i64)> = track_points
         .iter()
         .map(|q| (q.lat, q.lon, q.time_ms))
@@ -1790,6 +1881,12 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             log("[point-order] 重新规划或调整手绘轨迹，让轨迹只按点位次序穿过每个点");
         }
     }
+
+    log(&format!(
+        "[耗时] 采样+自检 {:.1}s · 全程 {:.1}s",
+        stage_t.elapsed().as_secs_f64(),
+        dry_t0.elapsed().as_secs_f64()
+    ));
 
     Ok(RunOutcome {
         policy: pol,
@@ -2394,9 +2491,9 @@ mod body_pace_tests {
         let note = body_pace_note(2000.0, 720, Some((5.0, 10.0))).unwrap();
         assert!(note.starts_with("! [pace]"), "{note}");
         assert!(note.contains("距区间边界只有"), "{note}");
-        // 起步窗口在 720 秒的记录上封顶 86 秒（改前按 15.5% 外推是 112 秒），
-        // 主体配速因此从 5'04" 抬到 5'17"，仍贴着下界 17 秒 → 依旧是要警告的形态。
-        assert!(note.contains("5'17"), "应报出主体配速，实际 {note}");
+        // 默认沿用上游的比例外推（不封顶）→ 5'04"；只有设了
+        // PACE_STARTUP_CAP_SEC=86 才会抬到 5'17"。
+        assert!(note.contains("5'04"), "应报出主体配速，实际 {note}");
     }
 
     /// 太慢：主体超过上界。
@@ -2492,6 +2589,17 @@ mod obs_tests {
 mod tests {
     use super::*;
 
+    /// 回归：只有用户明确选了操场才反推跑道。
+    ///
+    /// 「自动规划」被 `run_mode == 1` 一条判据带到 `try_stadium_track`，
+    /// 打卡点围成矩形就判成操场，画出一条不在跑道上的椭圆。
+    #[test]
+    fn stadium_attempt_requires_explicit_choice() {
+        assert!(should_try_stadium(1, true), "选了操场绕圈，试");
+        assert!(!should_try_stadium(1, false), "选了自动规划，不试");
+        assert!(!should_try_stadium(2, true), "户外跑没有操场可绕");
+    }
+
     /// 回归：补跑时刻必须按校时偏移搬到服务器轴上。
     ///
     /// 原来 `Some(t) => t + 0..4000` 只加了抖动，`skew` 只写进日志就被丢掉——
@@ -2535,7 +2643,7 @@ mod tests {
     #[test]
     fn stadium_radius_keeps_standard_400m_track() {
         let lat0 = 47.386;
-        let lng0 = 123.956;
+        let lng0 = 103.956;
         let klat = crate::track::geo::m_per_deg_lat(lat0);
         let klng = crate::track::geo::m_per_deg_lng(lat0);
         let mk = |dy: f64, dx: f64| Checkpoint {
@@ -2586,7 +2694,7 @@ mod tests {
     #[test]
     fn stadium_detects_oval_from_four_corners() {
         let lat0 = 47.386;
-        let lng0 = 123.956;
+        let lng0 = 103.956;
         let klat = crate::track::geo::m_per_deg_lat(lat0);
         let klng = crate::track::geo::m_per_deg_lng(lat0);
         let mk = |dy: f64, dx: f64| Checkpoint {
@@ -2627,7 +2735,7 @@ mod tests {
     #[test]
     fn stadium_rejects_scattered_checkpoints() {
         let lat0 = 47.386;
-        let lng0 = 123.956;
+        let lng0 = 103.956;
         let klat = crate::track::geo::m_per_deg_lat(lat0);
         let klng = crate::track::geo::m_per_deg_lng(lat0);
         let mk = |dy: f64, dx: f64| Checkpoint {
@@ -2663,7 +2771,7 @@ mod tests {
     #[test]
     fn stadium_snaps_infield_checkpoint_and_logs() {
         let lat0 = 47.386;
-        let lng0 = 123.956;
+        let lng0 = 103.956;
         let klat = crate::track::geo::m_per_deg_lat(lat0);
         let klng = crate::track::geo::m_per_deg_lng(lat0);
         let mk = |dy: f64, dx: f64| Checkpoint {
@@ -2709,12 +2817,12 @@ mod tests {
     /// 分支，这条主要是防将来放宽阈值后悄悄漏打卡。
     #[test]
     fn stadium_cp_fits_rejects_far_checkpoint() {
-        let pts = vec![(47.386, 123.956), (47.387, 123.956)];
+        let pts = vec![(47.386, 103.956), (47.387, 103.956)];
         let cps = vec![Checkpoint {
             lat: 47.396,
-            lng: 123.956,
+            lng: 103.956,
             glat: 47.396,
-            glon: 123.956,
+            glon: 103.956,
             name: "远处".into(),
         }];
         let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
@@ -2744,7 +2852,7 @@ mod tests {
         let clean_total = clean * spec.laps;
         for spacing in [5.2f64, 10.0, 14.9] {
             for seed in [42u64, 20261119, 7] {
-                let pts = crate::track::campus_oval_track((47.386, 123.956), &spec, spacing, seed);
+                let pts = crate::track::campus_oval_track((47.386, 103.956), &spec, spacing, seed);
                 let len = crate::track::geo::path_length(&pts);
                 assert!(
                     len < clean_total * 1.03 + 40.0,
@@ -3034,7 +3142,7 @@ mod single_point_source_tests {
             laps: 4.723,
         };
         // 几何仍用 5m 密采样（拐角/形状靠它），上报点按 5 秒取。
-        let xy = crate::track::campus_oval_track((47.3794, 123.9502), &spec, 5.0, 2026);
+        let xy = crate::track::campus_oval_track((47.3794, 103.9502), &spec, 5.0, 2026);
         let times =
             crate::track::sample_times(DURATION_SEC, START_MS, crate::track::SAMPLE_INTERVAL_SEC);
         let mut track: Vec<TrackPoint> = crate::track::sample_by_time(

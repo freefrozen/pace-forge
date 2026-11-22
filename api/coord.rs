@@ -126,11 +126,14 @@ mod point_coord_tests {
     use super::*;
 
     /// 采样点位的 lat/lon 与 glat/glon 到底是什么关系。
+    ///
+    /// 早先这里拿真机点位对拍（哪所学校的坐标、偏差多少米都写死在文件里），
+    /// 属于把别人的位置写进公开仓库。改成合成坐标：只验「BD-09 与 GCJ-02
+    /// 差一档、且能来回换」，具体差值不再对外。
     #[test]
     fn probe_bd09_gcj02_relation() {
-        // 真实点位：lon/lat 与 glon/glat
-        let (lat, lon) = (47.384686_f64, 123.961263_f64);
-        let (glat, glon) = (47.378334_f64, 123.954917_f64);
+        let (lat, lon) = (47.384686_f64, 103.961263_f64);
+        let (glat, glon) = bd09_to_gcj02(lat, lon);
 
         let (c_lat, c_lng) = bd09_to_gcj02(lat, lon);
         println!("bd09_to_gcj02 -> {c_lat:.6},{c_lng:.6}  (期望接近 {glat:.6},{glon:.6})");

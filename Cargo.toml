@@ -1,7 +1,9 @@
 [package]
 name = "pace-forge"
-version = "0.1.7"
+version = "0.1.10"
 edition = "2021"
+# 依赖链把 icu_* 钉在 1.88（idna → url → ureq），低于这个版本直接编译不过。
+rust-version = "1.88"
 description = "运动世界校园 自动刷跑客户端 · 纯 Rust，极验本地求解，数据自洽"
 license = "MIT"
 repository = "https://github.com/IRmsk/pace-forge"

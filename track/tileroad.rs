@@ -41,6 +41,26 @@ const TILE_HOSTS: [&str; 4] = [
 /// 再高一档瓦片数量翻四倍，覆盖一个校区要上百张，拉取时间不可接受。
 const ZOOM: u8 = 17;
 
+/// 单张瓦片的端点超时。原来 15 秒 × 4 个域名，一个校区十几张瓦片，
+/// 网络不顺时能卡十几分钟。高德瓦片正常几十毫秒就回，6 秒足够。
+const TILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// 四个域名全失败后的冷却：这段时间内不再拉瓦片，直接走几何规划。
+const TILE_DOWN_COOLDOWN_MS: u64 = 600_000;
+
+static TILE_DOWN_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tile_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn tile_cooling_at(now_ms: u64, down_at_ms: u64) -> bool {
+    down_at_ms != 0 && now_ms.saturating_sub(down_at_ms) < TILE_DOWN_COOLDOWN_MS
+}
+
 /// 单次最多拉多少张瓦片。12×12 = 144 张约覆盖 3.6 km 见方，
 /// 超过这个范围说明 bbox 不合理（或者调用方传错了坐标系）。
 const MAX_TILES: usize = 200;
@@ -177,6 +197,12 @@ fn fetch_tile_in(base: &std::path::Path, x: i32, y: i32) -> Result<image::RgbIma
     };
 
     let bytes = if bytes.is_empty() {
+        if tile_cooling_at(
+            tile_now_ms(),
+            TILE_DOWN_AT_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            return Err("高德瓦片刚全失败过，冷却中".into());
+        }
         let mut last = String::new();
         let mut got: Option<Vec<u8>> = None;
         for host in TILE_HOSTS {
@@ -184,21 +210,33 @@ fn fetch_tile_in(base: &std::path::Path, x: i32, y: i32) -> Result<image::RgbIma
             let resp = ureq::get(&url)
                 .set("User-Agent", "Mozilla/5.0 (compatible; pace-forge/0.1)")
                 .set("Referer", "https://www.amap.com/")
-                .timeout(std::time::Duration::from_secs(15))
+                .timeout(TILE_TIMEOUT)
                 .call();
             match resp {
                 Ok(r) => match read_all(r.into_reader()) {
-                    Ok(b) if b.len() > 512 => {
+                    // 空白格也是合法结果：高德在没有道路渲染的区域会回
+                    // ~179B 的纯色 PNG。原来用「>512 字节」判失败，于是
+                    // 西部/新校区整片判失败、还进 10 分钟冷却（#2 实测）。
+                    // 改成「能解码成图就收」——图里没路，后面的识别自然得出空集。
+                    Ok(b) if !b.is_empty() && image::load_from_memory(&b).is_ok() => {
                         got = Some(b);
                         break;
                     }
-                    Ok(_) => last = format!("{url} 返回内容过短"),
+                    Ok(b) if b.is_empty() => last = format!("{url} 返回空响应"),
+                    Ok(_) => last = format!("{url} 返回的不是可解码图片"),
                     Err(e) => last = format!("{url} 读取失败: {e}"),
                 },
                 Err(e) => last = format!("{url} 请求失败: {e}"),
             }
         }
-        let b = got.ok_or_else(|| format!("瓦片 {x}/{y} 拉取失败（{last}）"))?;
+        let b = match got {
+            Some(b) => b,
+            None => {
+                // 四个域名全挂：记冷却，后面的瓦片直接快速失败，不再逐张等。
+                TILE_DOWN_AT_MS.store(tile_now_ms(), std::sync::atomic::Ordering::Relaxed);
+                return Err(format!("瓦片 {x}/{y} 拉取失败（{last}）"));
+            }
+        };
         // 目录不存在时由 write_file_private 建出来（首次运行）
         let _ = crate::api::session::write_file_private(&path, &b);
         b
@@ -1563,6 +1601,16 @@ mod tests {
     use super::*;
     use crate::test_support::{assert_isolated, TestDir};
 
+    /// 瓦片冷却窗口：四个域名全挂后 10 分钟内直接快速失败。
+    #[test]
+    fn tile_cooldown_window() {
+        let t = 1_790_000_000_000u64;
+        assert!(!tile_cooling_at(t, 0));
+        assert!(tile_cooling_at(t, t - 1_000));
+        assert!(tile_cooling_at(t, t - (TILE_DOWN_COOLDOWN_MS - 1)));
+        assert!(!tile_cooling_at(t, t - TILE_DOWN_COOLDOWN_MS));
+    }
+
     /// 护栏：瓦片缓存目录的注入版**绝不能**落到真实 `$HOME/.pace-forge/tiles`。
     ///
     /// 模式与 `session::tests::test_data_dir_is_isolated_from_real_home` 一致。
@@ -1596,6 +1644,28 @@ mod tests {
             format!("{ZOOM}_123_456.png")
         );
         assert!(!t.data().exists(), "只算路径不该创建目录");
+    }
+
+    /// 空白瓦片是合法结果：高德在没有道路渲染的区域回 ~179B 的纯色 PNG。
+    /// 「长度小 = 失败」的判据会把整片区域判失败并进冷却（#2 实测），
+    /// 所以判据必须是「能不能解码」。
+    #[test]
+    fn tiny_blank_png_is_a_valid_tile() {
+        // 1×1 白色 PNG（比阈值 512B 小得多）
+        const BLANK: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        assert!(BLANK.len() < 512, "样例本身要小于旧阈值");
+        assert!(
+            image::load_from_memory(BLANK).is_ok(),
+            "空白图必须能被解码，否则新判据会把正常响应判成失败"
+        );
+        // 反过来：同样小的垃圾字节不能当成功
+        assert!(image::load_from_memory(&[0u8; 179]).is_err());
     }
 
     /// 缓存里那份超过 512B 但解码失败的坏瓦片，必须删掉而不是留下毒化缓存：
@@ -1698,13 +1768,13 @@ mod live_tests {
     #[ignore]
     fn live_closing_leg_not_backtracking() {
         let must = vec![
-            (47.385626, 123.955836),
-            (47.385718, 123.956956),
-            (47.386375, 123.958661),
-            (47.386792, 123.959479),
-            (47.387745, 123.959490),
+            (47.385626, 103.955836),
+            (47.385718, 103.956956),
+            (47.386375, 103.958661),
+            (47.386792, 103.959479),
+            (47.387745, 103.959490),
         ];
-        let net = fetch_roadnet((47.379, 123.950, 47.390, 123.964)).expect("瓦片路网");
+        let net = fetch_roadnet((47.379, 103.950, 47.390, 103.964)).expect("瓦片路网");
         let g = build_graph(&net, 25.0);
         let path = route_through(&g, &must, 2000.0).expect("规划");
         // route_through 返回的就是坐标序列
@@ -1761,8 +1831,8 @@ mod live_tests {
     #[test]
     #[ignore]
     fn live_campus_roadnet() {
-        // 齐齐哈尔医学院围栏范围（BD-09）
-        let bbox = (47.3796, 123.9514, 47.3888, 123.9631);
+        // 某校园围栏范围（合成）（BD-09）
+        let bbox = (47.3796, 103.9514, 47.3888, 103.9631);
         let t0 = std::time::Instant::now();
         let net = fetch_roadnet(bbox).expect("拉取失败");
         println!("{}  ({:.1}s)", net.source, t0.elapsed().as_secs_f64());
@@ -1770,11 +1840,11 @@ mod live_tests {
 
         // 服务端真实下发的 5 个打卡点（BD-09）
         let cps = [
-            (47.385626, 123.955836),
-            (47.385718, 123.956956),
-            (47.386375, 123.958661),
-            (47.386792, 123.959479),
-            (47.387745, 123.959490),
+            (47.385626, 103.955836),
+            (47.385718, 103.956956),
+            (47.386375, 103.958661),
+            (47.386792, 103.959479),
+            (47.387745, 103.959490),
         ];
 
         // 每个点都得离路网够近，否则图上根本走不到
@@ -1821,14 +1891,14 @@ mod live_tests {
     #[test]
     #[ignore]
     fn live_soften_shape() {
-        let bbox = (47.3796, 123.9514, 47.3888, 123.9631);
+        let bbox = (47.3796, 103.9514, 47.3888, 103.9631);
         let net = fetch_roadnet(bbox).expect("拉取失败");
         let cps = [
-            (47.385626, 123.955836),
-            (47.385718, 123.956956),
-            (47.386375, 123.958661),
-            (47.386792, 123.959479),
-            (47.387745, 123.959490),
+            (47.385626, 103.955836),
+            (47.385718, 103.956956),
+            (47.386375, 103.958661),
+            (47.386792, 103.959479),
+            (47.387745, 103.959490),
         ];
         let g = build_graph(&net, 25.0);
         let raw = route_through(&g, &cps, 2000.0).expect("连点失败");

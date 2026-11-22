@@ -67,20 +67,20 @@ App 详情页的「必到点位」是拿这份报文列表画的：`position` �
 `evidence/obs_real_20261002.json` → `fixed_point_json.fivePointJson`：
 
 ```json
-[{"flag":1790913882164,"glat":47.379397,"glon":123.950598,"id":81,"isFixed":1,
-  "isPass":true,"lat":47.385718,"lon":123.956956,"pointName":"丁香园正门",
+[{"flag":1790913882164,"glat":47.379397,"glon":103.950598,"id":81,"isFixed":1,
+  "isPass":true,"lat":47.385718,"lon":103.956956,"pointName":"北门",
   "position":0,"state":0},
- {"flag":1790913882164,"glat":47.38045,"glon":123.953128,"id":82,"isFixed":0,
-  "isPass":true,"lat":47.386792,"lon":123.959479,"pointName":"梅园2栋西",
+ {"flag":1790913882164,"glat":47.38045,"glon":103.953128,"id":82,"isFixed":0,
+  "isPass":true,"lat":47.386792,"lon":103.959479,"pointName":"2 号楼西",
   "position":1,"state":0},
- {"flag":1790913882164,"glat":47.378406,"glon":123.95016,"id":83,"isFixed":0,
-  "isPass":true,"lat":47.384723,"lon":123.956519,"pointName":"综合超市西北",
+ {"flag":1790913882164,"glat":47.378406,"glon":103.95016,"id":83,"isFixed":0,
+  "isPass":true,"lat":47.384723,"lon":103.956519,"pointName":"综合超市西北",
   "position":2,"state":0},
- {"flag":1790913882164,"glat":47.380039,"glon":123.952308,"id":84,"isFixed":0,
-  "isPass":true,"lat":47.386375,"lon":123.958661,"pointName":"秋实城北门",
+ {"flag":1790913882164,"glat":47.380039,"glon":103.952308,"id":84,"isFixed":0,
+  "isPass":true,"lat":47.386375,"lon":103.958661,"pointName":"秋实城北门",
   "position":3,"state":0},
- {"flag":1790913882164,"glat":47.379316,"glon":123.949474,"id":85,"isFixed":0,
-  "isPass":true,"lat":47.385626,"lon":123.955836,"pointName":"丁香2栋西南",
+ {"flag":1790913882164,"glat":47.379316,"glon":103.949474,"id":85,"isFixed":0,
+  "isPass":true,"lat":47.385626,"lon":103.955836,"pointName":"2 号楼西南",
   "position":4,"state":0}]
 ```
 
@@ -99,7 +99,7 @@ envelope 顶层与围栏（同一文件）：
 fixed_point_json = {
   "fivePointJson": "[…5 个点…]",
   "freedomShowFence": false,
-  "geoFencesJson": "[{\"distance\":0.0,\"id\":1668,\"name\":\"学校\",\"points\":[{\"glat\":47.382098,\"glng\":123.952159,\"lat\":47.388433,\"lng\":123.958514}, …20 个点…]}]",
+  "geoFencesJson": "[{\"distance\":0.0,\"id\":1668,\"name\":\"学校\",\"points\":[{\"glat\":47.382098,\"glng\":103.952159,\"lat\":47.388433,\"lng\":103.958514}, …20 个点…]}]",
   "runAreaId": -1,
   "useZip": false
 }
@@ -117,11 +117,11 @@ fixed_point_json = {
 
 | position | id | isFixed | isPass | pointName | 首次经过下标（内部量） |
 | --- | --- | --- | --- | --- | --- |
-| 0 | 81 | 1 | true | 梅园2栋西 | 0 |
+| 0 | 81 | 1 | true | 2 号楼西 | 0 |
 | 1 | 82 | 0 | true | 杏林3栋北 | 51 |
 | 2 | 83 | 0 | true | 杏林3栋西北 | 71 |
-| 3 | 84 | 0 | true | 丁香3栋北 | 88 |
-| 4 | 85 | 0 | true | 梅园4栋西 | 170 |
+| 3 | 84 | 0 | true | 3 号楼北 | 88 |
+| 4 | 85 | 0 | true | 4 号楼西 | 170 |
 
 `flag` 五个点全等 = `1794561660939`（本场 `startTime`，与 `save_record.startTime`
 同一个值；真机那场的 `flag` 是 1790913882164，语义相同、数值必然不同）。
@@ -129,23 +129,23 @@ fixed_point_json = {
 报文里的实际串（键序与真机一致）：
 
 ```json
-[{"flag":1794561660939,"glat":47.38045,"glon":123.953128,"id":81,"isFixed":1,"isPass":true,"lat":47.386792,"lon":123.959479,"pointName":"梅园2栋西","position":0,"state":0},
- {"flag":1794561660939,"glat":47.381798,"glon":123.952096,"id":82,"isFixed":0,"isPass":true,"lat":47.388133,"lon":123.958451,"pointName":"杏林3栋北","position":1,"state":0},
- {"flag":1794561660939,"glat":47.381423,"glon":123.95104,"id":83,"isFixed":0,"isPass":true,"lat":47.387749,"lon":123.957398,"pointName":"杏林3栋西北","position":2,"state":0},
- {"flag":1794561660939,"glat":47.381063,"glon":123.950126,"id":84,"isFixed":0,"isPass":true,"lat":47.38738,"lon":123.956487,"pointName":"丁香3栋北","position":3,"state":0},
- {"flag":1794561660939,"glat":47.381403,"glon":123.953139,"id":85,"isFixed":0,"isPass":true,"lat":47.387745,"lon":123.95949,"pointName":"梅园4栋西","position":4,"state":0}]
+[{"flag":1794561660939,"glat":47.38045,"glon":103.953128,"id":81,"isFixed":1,"isPass":true,"lat":47.386792,"lon":103.959479,"pointName":"2 号楼西","position":0,"state":0},
+ {"flag":1794561660939,"glat":47.381798,"glon":103.952096,"id":82,"isFixed":0,"isPass":true,"lat":47.388133,"lon":103.958451,"pointName":"杏林3栋北","position":1,"state":0},
+ {"flag":1794561660939,"glat":47.381423,"glon":103.95104,"id":83,"isFixed":0,"isPass":true,"lat":47.387749,"lon":103.957398,"pointName":"杏林3栋西北","position":2,"state":0},
+ {"flag":1794561660939,"glat":47.381063,"glon":103.950126,"id":84,"isFixed":0,"isPass":true,"lat":47.38738,"lon":103.956487,"pointName":"3 号楼北","position":3,"state":0},
+ {"flag":1794561660939,"glat":47.381403,"glon":103.953139,"id":85,"isFixed":0,"isPass":true,"lat":47.387745,"lon":103.95949,"pointName":"4 号楼西","position":4,"state":0}]
 ```
 
-注意首点变了：改前 `isFixed=1` 落在「梅园4栋西」（服务端 `isFixed` 原值），
-改后落在「梅园2栋西」——它是我们这条轨迹**最先经过**的必到点（下标 0），
-也就是真机语义里 `position=0` 的那个点。真机首点是「丁香园正门」，因为
+注意首点变了：改前 `isFixed=1` 落在「4 号楼西」（服务端 `isFixed` 原值），
+改后落在「2 号楼西」——它是我们这条轨迹**最先经过**的必到点（下标 0），
+也就是真机语义里 `position=0` 的那个点。真机首点是「北门」，因为
 它那条路线从那里起步。
 
 `geoFencesJson`（同一份围栏环重算，与真机逐字段对比）：
 
 ```text
-我们: [{"distance":0.0,"id":1668,"name":"学校","points":[{"glat":47.382099,"glng":123.952159,"lat":47.388433,"lng":123.958514}, …]}] 
-真机: [{"distance":0.0,"id":1668,"name":"学校","points":[{"glat":47.382098,"glng":123.952159,"lat":47.388433,"lng":123.958514}, …]}]
+我们: [{"distance":0.0,"id":1668,"name":"学校","points":[{"glat":47.382099,"glng":103.952159,"lat":47.388433,"lng":103.958514}, …]}] 
+真机: [{"distance":0.0,"id":1668,"name":"学校","points":[{"glat":47.382098,"glng":103.952159,"lat":47.388433,"lng":103.958514}, …]}]
                                               ↑ 末位 1e-6 的差（≈0.1m），见「还剩哪些不一致」
 ```
 
@@ -229,7 +229,7 @@ test result: ok. 273 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; fi
 改前那一版是**对的**：`isFixed` 原样回显服务端值。上面「改后」为了对齐真机
 样本，把它换成了 `if position == 0 { 1 } else { 0 }`——按途经顺序猜。
 
-错在哪：真机 rrid 1328288734 的固定点（id 81「丁香园正门」，校门闸机）恰好
+错在哪：真机 rrid 1328288734 的固定点（id 81「北门」，校门闸机）恰好
 就是第一个经过的，于是「首点 = 固定点」在样本上成立。但语义是**服务端说哪个
 点是固定打卡点就是哪个**，与途经顺序毫无关系。服务端把固定点排在第 4 位时，
 我们就标错了点。

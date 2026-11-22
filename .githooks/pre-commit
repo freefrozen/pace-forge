@@ -1,0 +1,6 @@
+#!/bin/sh
+# 提交前扫一遍凭证与个人信息。CI 也有同一道，这里只是让人早一步知道。
+python3 tools/check_secrets.py || {
+  echo "提交被拦：先按上面的提示改掉，再 git add。"
+  exit 1
+}

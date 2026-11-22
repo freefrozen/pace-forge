@@ -458,6 +458,34 @@ button.danger:hover:not(:disabled) { background: var(--danger-hi); border-color:
     <div id="accMsg" class="msg"></div>
   </div>
 
+  <div class="panel" id="devPanel">
+    <h2>设备机型 <span class="hint" style="font-weight:400">cpuModel</span></h2>
+    <div class="kv"><span>当前发出</span><b id="devCpu">…</b></div>
+    <div class="kv"><span>机型来源</span><b id="devSrc" class="hint">未设置（ABI 兜底）</b></div>
+    <div class="runform" style="margin-top:8px">
+      <input id="devSearch" placeholder="搜型号定位：Xiaomi 13 / 2211133C" aria-label="搜索机型">
+      <select id="devBrand" aria-label="品牌"><option value="">品牌…</option></select>
+      <select id="devModel" aria-label="机型"><option value="">先选品牌</option></select>
+      <select id="devPlatformSel" aria-label="平台"><option value="">平台（可选）</option></select>
+      <button id="devApply">应用</button>
+      <button class="ghost" id="devClear">恢复 ABI</button>
+    </div>
+    <div id="devMsg" class="msg"></div>
+  </div>
+
+  <div class="panel" id="egressPanel">
+    <h2>网络出口 <span class="hint" style="font-weight:400">提交走哪条线路</span></h2>
+    <div class="kv"><span>当前出口</span><b id="egIp">…</b></div>
+    <div class="kv"><span>代理</span><b id="egProxy" class="hint">未设置（直连）</b></div>
+    <div class="runform" style="margin-top:8px">
+      <input id="egInput" placeholder="http://host:port（留空=直连）" aria-label="代理地址">
+      <button id="egSave">保存</button>
+      <button class="ghost" id="egProbe">重新探测</button>
+    </div>
+    <div id="egMsg" class="msg"></div>
+  </div>
+  </div>
+
   <div class="panel" id="semPanel">
     <h2>记分跑 · 学期进度</h2>
     <div id="semOut" class="planout"><div class="hint">点顶部「查学期」加载</div></div>
@@ -505,6 +533,9 @@ button.danger:hover:not(:disabled) { background: var(--danger-hi); border-color:
         <input id="rAutoDur" type="checkbox" checked> 时长自动
         <span id="durHint" class="hint"></span>
       </label>
+
+      <label class="chkline" title="不拉 OSM 路网、不拉高德瓦片，直接按几何连打卡点。网络连不上这两个源时最快，代价是轨迹不沿真实道路">
+        <input id="rNoRoads" type="checkbox"> 纯几何（跳过路网）</label>
       <label>时长 分<input id="rDur" type="number" value="12" step="0.1" min="3" max="180" readonly></label>
       <label>步数<input id="rSteps" type="number" step="10" min="100" placeholder="自动"
         title="留空则按配速区间推算步数，一般不用填"></label>
@@ -540,12 +571,15 @@ button.danger:hover:not(:disabled) { background: var(--danger-hi); border-color:
         <button id="llPick" class="ghost" type="button">在地图上点选</button>
         <button id="llFetch" class="ghost" type="button"
                 title="只拉围栏和必到点，不生成轨迹">查围栏/点位</button>
+        <button id="netcheckBtn" class="ghost" type="button"
+                title="分别探测 Overpass 与高德瓦片，生成慢时用它定位是哪条链路">网络自检</button>
         <label style="margin:0" title="账号下发了多个校区/场地时在这里切换；选中会把定位锚点挪到该围栏中心">
           <select id="fenceSel" class="coord-input" style="min-width:130px" aria-label="校区/场地">
             <option value="">校区/场地（先查一次）</option>
           </select></label>
         <button id="llClear" class="ghost" type="button">清空</button>
         <span id="llInfo" class="hint"></span>
+        <pre id="ncOut" class="mono" style="display:none;flex-basis:100%;margin:6px 0 0;font-size:11px;line-height:1.6;white-space:pre-wrap;color:var(--dim)"></pre>
       </div>
 
       <div id="blockWrap" style="flex-basis:100%;margin-top:6px">
@@ -766,11 +800,17 @@ $('logout').onclick = async () => {
     // 必须走 api() 那条链路：口令部署下裸 fetch 不带 X-Pace-Token，
     // 请求在 check_auth 就被拒，服务端 token / 上游会话 / 当前账号一律
     // 没清，页面却以为自己退出成功了。
-    await fetch('/api/logout', {
+    const res = await fetch('/api/logout', {
       method: 'POST',
       cache: 'no-store',
       headers: authHeaders()
     });
+    // 服务端可能没确认（网络/接口失败）。本地照清，但得让用户知道会话
+    // 还活着——不说一声，半小时内重登就会撞 10121 锁一小时。
+    const r = await res.json().catch(() => ({ remoteLogout: false }));
+    if (!r.remoteLogout) {
+      alert('本地已退出，但服务端没有确认（网络或接口失败）。\n半小时内别重登，否则可能被锁一小时。');
+    }
   } catch (_) {}
   // 清掉本地残留，避免任何 form/地图状态带回来
   try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}
@@ -893,6 +933,7 @@ $('planBtn').onclick = async () => {
         distance: dist, duration: dur,
         steps: (Number.isFinite(steps) && steps > 0) ? steps : 0,
         mode: $('rMode').value, lane: parseInt($('rLane').value, 10) || 1,
+        preferRoads: !$('rNoRoads').checked,
         runMode: parseInt($('rRunMode').value, 10) || 1,
         startAtMs: (st ? st.startMs : undefined),
         ...locBody(),
@@ -930,6 +971,7 @@ $('planBtn').onclick = async () => {
       ${policyHtml}
       <div class="kv"><span>实际里程</span><b>${r.actualLength} m</b></div>
       <div class="kv"><span>轨迹点数</span><b>${r.pointCount}</b></div>
+      <div class="kv"><span>地图</span><b class="ok">${r.coords && r.coords.length ? `已画 ${r.coords.length} 点（取消勾选「预览轨迹」可隐藏）` : '没有轨迹点可画'}</b></div>
       <div class="kv"><span>时间桶</span><b>${r.bucketCount}</b></div>
       <div class="kv"><span>平均步频</span><b>${(r.avgCadence ?? 0).toFixed(1)} 步/分</b></div>
       <div class="kv"><span>步数自相关</span><b>${acTxt}</b></div>
@@ -1017,6 +1059,7 @@ $('runBtn').onclick = async () => {
         sportType: 1,
         mode: $('rMode').value,
         lane: parseInt($('rLane').value, 10) || 1,
+        preferRoads: !$('rNoRoads').checked,
         ...altBody(),
         startAtMs: (st ? st.startMs : undefined),
         ...locBody(),
@@ -1078,6 +1121,140 @@ function fenceIsGcj(f) {
   return !!(f && Array.isArray(f.ringGcj) && f.ringGcj.length);
 }
 
+  // ── 网络出口（代理） ──────────────────────────────────────────────
+  // 保存后重建所有 client，提交链路下一次请求就走新出口；探测接口本身仍直连。
+  async function egLoad() {
+    try {
+      const d = await api('/api/egress-ip');
+      $('egIp').textContent = d.ok ? `${d.ip}（${d.source}）` : '未知';
+      $('egProxy').textContent = d.proxy || '未设置（直连）';
+      $('egProxy').className = d.proxy ? 'ok' : 'hint';
+    } catch (e) {
+      $('egIp').textContent = '读取失败';
+    }
+  }
+  async function egSave(proxy) {
+    try {
+      const d = await api('/api/egress', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxy })
+      });
+      $('egMsg').className = 'msg ok';
+      $('egMsg').textContent = `${d.note}（重建 ${d.rebuilt} 个会话）`;
+      await egLoad();
+    } catch (e) {
+      $('egMsg').className = 'msg err';
+      $('egMsg').textContent = '保存失败：' + e.message;
+    }
+  }
+  if ($('egInput')) {
+    $('egSave').onclick = () => {
+      const v = $('egInput').value.trim();
+      $('egMsg').textContent = '';
+      egSave(v || null);
+    };
+    $('egProbe').onclick = () => { egLoad(); };
+    egLoad();
+  }
+
+  // ── 设备机型（按品牌分组的两个下拉） ──────────────────────────────
+  // 品牌 → 机型 两级联动，平台单独一个下拉（内置 17 条）。
+  // 只改 cpuModel，不动 device_id；映射按账号落在本机。
+  const DEV = { brands: [], platforms: [], model: '' };
+  function devRender(d) {
+    DEV.model = d.model || '';
+    $('devCpu').textContent = d.cpuModel || 'arm64-v8a';
+    const hit = d.catalogHit;
+    $('devSrc').textContent = d.model
+      ? `${d.model}${hit ? ` · ${hit.brand} ${hit.name}` : '（官方目录未收录）'}`
+      : '未设置（ABI 兜底）';
+    $('devSrc').className = d.abiFallback ? 'hint' : 'ok';
+  }
+  function devFillSelect(el, placeholder, items, labelOf, valueOf) {
+    el.innerHTML = '';
+    el.appendChild(new Option(placeholder, ''));
+    for (const it of items) el.appendChild(new Option(labelOf(it), valueOf(it)));
+  }
+  async function devInit() {
+    try {
+      const d = await api('/api/device');
+      DEV.brands = d.brands || [];
+      DEV.platforms = d.platforms || [];
+      devRender(d);
+      devFillSelect($('devBrand'), '品牌…', DEV.brands,
+        b => `${b.name}（${b.count}）`, b => b.name);
+      devFillSelect($('devPlatformSel'), '平台（可选）', DEV.platforms,
+        p => `${p.name}（${p.code} → ${p.soc}）`, p => p.code);
+      // 当前机型所属品牌预选，省得每次重新找
+      if (d.catalogHit) {
+        const opt = [...$('devBrand').options].find(o => o.value.toLowerCase() === String(d.catalogHit.brand).toLowerCase());
+        if (opt) { $('devBrand').value = opt.value; await devPickBrand(opt.value); }
+      }
+    } catch (e) {
+      $('devMsg').className = 'msg err';
+      $('devMsg').textContent = '读取机型列表失败：' + e.message;
+    }
+  }
+  async function devPickBrand(brand) {
+    const sel = $('devModel');
+    if (!brand) { devFillSelect(sel, '先选品牌', [], () => '', () => ''); return; }
+    sel.innerHTML = '';
+    sel.appendChild(new Option('加载中…', ''));
+    try {
+      const d = await api('/api/device?brand=' + encodeURIComponent(brand));
+      devFillSelect(sel, '机型…', d.results || [],
+        r => `${r.name} · ${r.model}`, r => r.model);
+    } catch (e) {
+      devFillSelect(sel, '读取失败', [], () => '', () => '');
+      $('devMsg').className = 'msg err';
+      $('devMsg').textContent = e.message;
+    }
+  }
+  async function devSave(model, platform) {
+    try {
+      const d = await api('/api/device', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, platform: platform || undefined })
+      });
+      devRender(d);
+      $('devMsg').className = 'msg ok';
+      $('devMsg').textContent = d.note || '已保存';
+    } catch (e) {
+      $('devMsg').className = 'msg err';
+      $('devMsg').textContent = '保存失败：' + e.message;
+    }
+  }
+  if ($('devBrand')) {
+    // 搜索直接用目录检索，输什么都在列表里出现；清空就回到按品牌浏览。
+    let devTimer = null;
+    $('devSearch').oninput = () => {
+      clearTimeout(devTimer);
+      const q = $('devSearch').value.trim();
+      devTimer = setTimeout(async () => {
+        if (!q) { await devPickBrand($('devBrand').value); return; }
+        try {
+          const d = await api('/api/device?q=' + encodeURIComponent(q));
+          devFillSelect($('devModel'), '搜索结果', d.results || [],
+            r => `${r.name} · ${r.model}`, r => r.model);
+        } catch (e) {
+          $('devMsg').className = 'msg err';
+          $('devMsg').textContent = e.message;
+        }
+      }, 300);
+    };
+    $('devBrand').onchange = () => { $('devSearch').value = ''; devPickBrand($('devBrand').value); };
+    $('devApply').onclick = () => {
+      const model = $('devModel').value;
+      if (!model) { $('devMsg').className = 'msg err'; $('devMsg').textContent = '先选一个机型'; return; }
+      devSave(model, $('devPlatformSel').value);
+    };
+    $('devClear').onclick = () => {
+      $('devMsg').textContent = '';
+      devSave(null);
+    };
+    devInit();
+  }
+
 function drawPreview(coords, fence, checkpoints) {
   if (!map) return;
   // 后端在手绘、操场、部分预览分支返回的是 `checkpoints: []`——空数组在 JS 里
@@ -1107,13 +1284,19 @@ function drawPreview(coords, fence, checkpoints) {
   if (coords && coords.length) {
     trackLayer = L.layerGroup();
     L.polyline(coords, { color: tok('--accent'), weight: 4, opacity: 0.9 }).addTo(trackLayer);
-    if ($('showTrack') && $('showTrack').checked) trackLayer.addTo(map);
+    // 生成成功就把线亮出来：这个复选框默认不勾，用户点完「生成轨迹」只看到
+    // 自检通过、地图上一片空白，会以为生成失败（#2 报的就是这个）。想隐藏
+    // 再取消勾选即可，下一次生成会重新亮。
+    const cbTrack = $('showTrack');
+    if (cbTrack && !cbTrack.checked) cbTrack.checked = true;
+    trackLayer.addTo(map);
   }
 
   // 打卡点
   if (cps && cps.length) {
     for (const c of cps) {
-      // 高德瓦片是 GCJ-02 网格，所以打点要用 gcjLat/gcjLng（/api/plan 两个
+    
+  // 高德瓦片是 GCJ-02 网格，所以打点要用 gcjLat/gcjLng（/api/plan 两个
       // 都给了：lat/lng 是 BD-09，gcjLat/gcjLng 是 GCJ-02）。字段名与有效性
       // 统一交给 coordOf，取不到有效坐标就跳过，不拿占位值往图上画。
       const ll = coordOf(c);
@@ -1240,8 +1423,10 @@ async function accountAction(act, id) {
       // 退出登录：通知服务端让 token 失效，本地只清登录态，密码留着。
       // 不走这一步直接删账号的话，服务端会话还活着，账号仍被标记「已登录」，
       // 下次登录触发 10121 并锁一小时。
-      await api('/api/accounts/' + encodeURIComponent(id) + '/logout', { method: 'POST' });
-      m.textContent = '已退出登录，密码已保留，随时可以重登';
+      const r = await api('/api/accounts/' + encodeURIComponent(id) + '/logout', { method: 'POST' });
+      m.textContent = r.remoteLogout
+        ? '已退出登录，密码已保留，随时可以重登'
+        : '本地已退出，服务端未确认（半小时内别重登）';
     } else if (act === 'toggle') {
       await api('/api/accounts/' + encodeURIComponent(id) + '/toggle', { method: 'POST' });
       m.textContent = '';
@@ -1790,7 +1975,34 @@ function initLoc() {
     fetchBtn.addEventListener('click', fetchFencesAndPoints);
   }
 
+  const ncBtn = $('netcheckBtn');
+  if (ncBtn && !ncBtn.__bound) {
+    ncBtn.__bound = true;
+    ncBtn.addEventListener('click', runNetcheck);
+  }
+
   if (info && !info.textContent) info.textContent = '填经纬度后点「定位」';
+}
+
+/* 网络自检：生成卡住时先点这个，确认是 Overpass 还是瓦片那条链路不通 */
+async function runNetcheck() {
+  const btn = $('netcheckBtn'), out = $('ncOut');
+  busy(btn, true);
+  out.style.display = 'block';
+  out.textContent = '检测中…（Overpass 每项最多 8 秒，瓦片 6 秒）';
+  try {
+    const d = await api('/api/netcheck', { cache: 'no-store' });
+    const lines = (d.items || []).map(it =>
+      `${it.ok ? '✓' : '✗'} ${it.name}  ${it.ms}ms${it.ok ? '' : '  ' + (it.detail || '')}`);
+    lines.push('');
+    lines.push(d.hint || '');
+    lines.push(`版本 ${d.version || '未知'}`);
+    out.textContent = lines.join('\n');
+  } catch (e) {
+    out.textContent = '自检失败：' + ((e && e.message) || e);
+  } finally {
+    busy(btn, false);
+  }
 }
 
 /* ---------- 手绘轨迹 ---------- */
@@ -2297,7 +2509,7 @@ async function selectRec(r, el) {
       $('detail').innerHTML = detailHtml(d, pts.length);
     } else {
       // 画不出线时**不要移动地图**。这里原来 setView 到成都 (30.5,104.0)，
-      // 一个齐齐哈尔的记录点进去，地图直接跳到四川，比不画线更迷惑。
+      // 一个东北某平原校区的记录点进去，地图直接跳到四川，比不画线更迷惑。
       // 保持当前视图即可，用户自己知道这条记录在哪跑的。
       $('detail').innerHTML = detailHtml(d, pts.length) +
         (pts.length === 1
@@ -2385,7 +2597,7 @@ function findTrack(obj) {
 ///
 /// 真机的点位对象长这样（OBS 里 25 个字段那份，见
 /// re/zjwh740/evidence/obs_real_20261002.json）：
-///   { lat: -1.0, lng: -1.0, gLat: "48.123456", gLng: "124.123456", ... }
+///   { lat: -1.0, lng: -1.0, gLat: "48.123456", gLng: "104.123456", ... }
 /// `lat`/`lng` 固定填 -1，是 App 的「未定位」哨兵；真实坐标在 gLat/gLng。
 /// 服务端另有一批响应把 lat/lon 填 0（api/coord.rs 顶部注释写了）。
 /// 这两个值都不是坐标，不能拿来画图、也不能算「有点位」。

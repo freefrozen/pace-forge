@@ -11,11 +11,123 @@ use crate::api::session::home_dir;
 use serde_json::Value;
 
 /// Overpass 端点。主站经常 502/504，准备了两个镜像轮询。
-const OVERPASS_HOSTS: [&str; 3] = [
+pub(crate) const OVERPASS_HOSTS: [&str; 3] = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ];
+
+/// 单个端点的超时。原来这里是 60~70 秒，再乘 3 个镜像、3 类查询（建筑、
+/// 水体、路网），国内网络打不开 Overpass 时一次生成能卡近十分钟——用户看到
+/// 的就是「点了生成，半天没反应」。校园 bbox 的查询正常几秒就回，6 秒足够。
+const HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// 竞速窗口：三个端点**同时**打，先回先用。
+///
+/// 之前是串行 for 循环，每个端点各等 `HOST_TIMEOUT`：全线不通时 3×10=30 秒
+/// 才进冷却，用户报的「8~9 秒超时」就是单端点在排队。并发之后总等待等于
+/// 最快的那个端点，不通时最坏也只有这一个窗口。
+///
+/// 窗口与单端点超时取同一个值：窗口结束后线程最多再活一个 `HOST_TIMEOUT`
+/// 就自行退出，不会在后台堆线程。
+const RACE_WINDOW: std::time::Duration = HOST_TIMEOUT;
+
+/// 三个端点全线失败后的冷却时长：这段时间内不再打 Overpass，直接走瓦片/几何。
+///
+/// 没有它的话，同一次生成里建筑、水体、路网三查各失败一遍（30 秒），
+/// 下一次生成又从零开始——网络不通的用户每次都要等一遍。
+const DOWN_COOLDOWN_MS: u64 = 600_000;
+
+static DOWN_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 冷却判断抽成纯函数，方便用固定时刻测窗口边界。
+fn cooling_at(now_ms: u64, down_at_ms: u64) -> bool {
+    down_at_ms != 0 && now_ms.saturating_sub(down_at_ms) < DOWN_COOLDOWN_MS
+}
+
+/// 打单个端点。
+fn post_one(host: &str, body: &str) -> Result<String, String> {
+    match ureq::post(host)
+        .set("User-Agent", "pace-forge/0.1 (route planning)")
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(HOST_TIMEOUT)
+        .send_string(body)
+    {
+        Ok(r) => match r.into_string() {
+            Ok(t) if t.contains("\"elements\"") => Ok(t),
+            Ok(_) => Err(format!("{host} 内容异常")),
+            Err(e) => Err(format!("{host} 读取失败: {e}")),
+        },
+        Err(e) => Err(format!("{host} 请求失败: {e}")),
+    }
+}
+
+/// 从竞速通道里取第一个成功结果，同时收集各端点的失败原因。
+///
+/// 只依赖 channel，不碰网络：测试里喂假结果就能覆盖「先到即用」「全失败」
+/// 「窗口内一个都没回」三种情形。
+fn select_first_ok(
+    rx: &std::sync::mpsc::Receiver<(usize, Result<String, String>)>,
+    window: std::time::Duration,
+) -> (Option<String>, Vec<String>) {
+    let deadline = std::time::Instant::now() + window;
+    let mut errs = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((_idx, Ok(text))) => return (Some(text), errs),
+            Ok((_idx, Err(e))) => errs.push(e),
+            // 超时，或者所有发送端都已退出（小概率：端点比窗口先全挂）
+            Err(_) => break,
+        }
+    }
+    (None, errs)
+}
+
+/// 打 Overpass：并发竞速、窗口超时、全线失败后进入冷却。
+fn overpass_post(body: &str, what: &str) -> Result<String, String> {
+    if cooling_at(
+        now_ms_u64(),
+        DOWN_AT_MS.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        return Err(format!(
+            "Overpass 刚失败过，{} 分钟内不再重试（{what}）",
+            DOWN_COOLDOWN_MS / 60_000
+        ));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (idx, host) in OVERPASS_HOSTS.iter().enumerate() {
+        let tx = tx.clone();
+        let host = *host;
+        let body = body.to_string();
+        // 不 join：窗口一到就返回，慢端点自行超时退出（最长再等 HOST_TIMEOUT）。
+        std::thread::spawn(move || {
+            let _ = tx.send((idx, post_one(host, &body)));
+        });
+    }
+    drop(tx);
+
+    let (ok, errs) = select_first_ok(&rx, RACE_WINDOW);
+    if let Some(text) = ok {
+        return Ok(text);
+    }
+    DOWN_AT_MS.store(now_ms_u64(), std::sync::atomic::Ordering::Relaxed);
+    let last = errs.last().cloned().unwrap_or_else(|| "窗口内没有端点返回".into());
+    Err(format!(
+        "所有 Overpass 端点都失败（{what}，并发竞速 {}s，最后一次: {last}）",
+        RACE_WINDOW.as_secs()
+    ))
+}
 
 /// 打算走的路类型。excluding motorway/trunk：校园里没有，且人不能跑。
 /// 包括 footway/path/pedestrian/steps/track/service/residential/unclassified/living_street/cycleway。
@@ -107,29 +219,7 @@ pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
     );
 
     let body = format!("data={}", urlencode(&query));
-    let mut text = String::new();
-    let mut last_err = String::new();
-    for host in OVERPASS_HOSTS {
-        let resp = ureq::post(host)
-            .set("User-Agent", "pace-forge/0.1 (route planning)")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(std::time::Duration::from_secs(70))
-            .send_string(&body);
-        match resp {
-            Ok(r) => match r.into_string() {
-                Ok(t) if t.contains("\"elements\"") => {
-                    text = t;
-                    break;
-                }
-                Ok(_) => last_err = format!("{host} 返回内容异常"),
-                Err(e) => last_err = format!("{host} 读取失败: {e}"),
-            },
-            Err(e) => last_err = format!("{host} 请求失败: {e}"),
-        }
-    }
-    if text.is_empty() {
-        return Err(format!("所有 Overpass 端点都失败（最后一次: {last_err}）"));
-    }
+    let text = overpass_post(&body, "路网")?;
 
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("路网 JSON 解析失败: {e}"))?;
     let elements = v
@@ -271,29 +361,7 @@ pub fn fetch_water(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, S
         "[out:json][timeout:30];         (way[\"natural\"=\"water\"]({min_lat},{min_lon},{max_lat},{max_lon});          way[\"waterway\"~\"river|stream|canal\"]({min_lat},{min_lon},{max_lat},{max_lon}););         out geom;"
     );
     let body = format!("data={}", urlencode(&query));
-    let mut text = String::new();
-    let mut last_err = String::new();
-    for host in OVERPASS_HOSTS {
-        match ureq::post(host)
-            .set("User-Agent", "pace-forge/0.1 (route planning)")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(std::time::Duration::from_secs(60))
-            .send_string(&body)
-        {
-            Ok(r) => match r.into_string() {
-                Ok(t) if t.contains("\"elements\"") => {
-                    text = t;
-                    break;
-                }
-                Ok(_) => last_err = format!("{host} 内容异常"),
-                Err(e) => last_err = format!("{host} 读取失败: {e}"),
-            },
-            Err(e) => last_err = format!("{host} 请求失败: {e}"),
-        }
-    }
-    if text.is_empty() {
-        return Err(format!("拉水域失败: {last_err}"));
-    }
+    let text = overpass_post(&body, "水域")?;
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("水域 JSON 解析失败: {e}"))?;
     let mut polys = Vec::new();
     if let Some(els) = v.get("elements").and_then(|e| e.as_array()) {
@@ -399,29 +467,7 @@ pub fn fetch_buildings(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>
 /// Overpass 拉 polygon 的公共部分（水体、建筑共用）。
 fn fetch_polys(query: &str, what: &str) -> Result<Vec<Vec<(f64, f64)>>, String> {
     let body = format!("data={}", urlencode(query));
-    let mut text = String::new();
-    let mut last_err = String::new();
-    for host in OVERPASS_HOSTS {
-        match ureq::post(host)
-            .set("User-Agent", "pace-forge/0.1 (route planning)")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .timeout(std::time::Duration::from_secs(60))
-            .send_string(&body)
-        {
-            Ok(r) => match r.into_string() {
-                Ok(t) if t.contains("\"elements\"") => {
-                    text = t;
-                    break;
-                }
-                Ok(_) => last_err = format!("{host} 内容异常"),
-                Err(e) => last_err = format!("{host} 读取失败: {e}"),
-            },
-            Err(e) => last_err = format!("{host} 请求失败: {e}"),
-        }
-    }
-    if text.is_empty() {
-        return Err(format!("拉{what}失败: {last_err}"));
-    }
+    let text = overpass_post(&body, what)?;
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("{what} JSON 解析失败: {e}"))?;
     let mut polys = Vec::new();
     if let Some(els) = v.get("elements").and_then(|e| e.as_array()) {
@@ -808,10 +854,66 @@ pub fn bbox_of(points: &[(f64, f64)], pad_m: f64) -> (f64, f64, f64, f64) {
 mod tests {
     use super::*;
 
+    /// 冷却窗口：失败后 10 分钟内不再打 Overpass，过了窗口重新允许。
+    #[test]
+    fn overpass_cooldown_window() {
+        let t = 1_790_000_000_000u64;
+        assert!(!cooling_at(t, 0), "没失败过，正常请求");
+        assert!(cooling_at(t, t - 1_000), "刚失败，冷却中");
+        assert!(
+            cooling_at(t, t - (DOWN_COOLDOWN_MS - 1)),
+            "差 1ms 到窗口，仍冷却"
+        );
+        assert!(
+            !cooling_at(t, t - DOWN_COOLDOWN_MS),
+            "到点解冻，重新给 Overpass 机会"
+        );
+    }
+
+    /// 竞速：一个端点先回成功，即使前面有失败也不等其余端点。
+    #[test]
+    fn race_returns_first_success_without_waiting() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((0, Err("主站 502".to_string()))).unwrap();
+        tx.send((1, Ok("{\"elements\":[]}".to_string()))).unwrap();
+        // 故意不 drop(tx)：还有一个「慢端点」没回，竞速不能等它。
+        let t0 = std::time::Instant::now();
+        let (ok, errs) = select_first_ok(&rx, std::time::Duration::from_secs(5));
+        drop(tx);
+        assert!(ok.expect("应取到成功结果").contains("elements"));
+        assert_eq!(errs.len(), 1, "失败原因要一并收集: {errs:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "不该等到窗口结束");
+    }
+
+    /// 竞速：窗口内没有任何成功，返回空并保留失败原因。
+    #[test]
+    fn race_collects_errors_when_all_fail() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((0, Err("a 超时".to_string()))).unwrap();
+        tx.send((1, Err("b 502".to_string()))).unwrap();
+        tx.send((2, Err("c 内容异常".to_string()))).unwrap();
+        drop(tx);
+        let (ok, errs) = select_first_ok(&rx, std::time::Duration::from_secs(1));
+        assert!(ok.is_none());
+        assert_eq!(errs.len(), 3);
+        assert_eq!(errs.last().unwrap(), "c 内容异常");
+    }
+
+    /// 竞速：窗口到期一个结果都没有，要按时退出，不能死等。
+    #[test]
+    fn race_times_out_at_window() {
+        let (_tx, rx) = std::sync::mpsc::channel::<(usize, Result<String, String>)>();
+        let t0 = std::time::Instant::now();
+        let (ok, errs) = select_first_ok(&rx, std::time::Duration::from_millis(120));
+        assert!(ok.is_none() && errs.is_empty());
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(110));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "窗口就是上限");
+    }
+
     fn l_shape_net() -> RoadNet {
         // 一个直角路口：东西向 + 南北向各一段
         let lat0 = 31.2304;
-        let lon0 = 121.4737;
+        let lon0 = 101.4737;
         let mut segs = vec![RoadSegment {
             points: (0..=20)
                 .map(|i| (lat0, lon0 + i as f64 * 10.0 / m_per_deg_lng(lat0)))
@@ -834,7 +936,7 @@ mod tests {
     #[test]
     fn must_point_unreachable_returns_err() {
         let lat0 = 31.2304;
-        let lon0 = 121.4737;
+        let lon0 = 101.4737;
         let mlng = m_per_deg_lng(lat0);
         let mlat = m_per_deg_lat(lat0);
         // 第一段：东西向 100m，起点区域
@@ -873,7 +975,7 @@ mod tests {
     #[test]
     fn route_stays_on_segments() {
         let net = l_shape_net();
-        let r = route_on_roads(&net, (31.2304, 121.4737), &[], 300.0, 7).unwrap();
+        let r = route_on_roads(&net, (31.2304, 101.4737), &[], 300.0, 7).unwrap();
         assert!(r.points.len() > 5);
         // 每个点都必须落在某一段路上（端点之间线性插值也在路上）
         for p in &r.points {
@@ -888,7 +990,7 @@ mod tests {
     fn route_length_is_bounded() {
         let net = l_shape_net();
         for want in [100.0, 200.0, 400.0] {
-            let r = route_on_roads(&net, (31.2304, 121.4737), &[], want, 3).unwrap();
+            let r = route_on_roads(&net, (31.2304, 101.4737), &[], want, 3).unwrap();
             assert!(
                 r.length_m <= want * 1.1,
                 "走了 {:.0}m 超过目标 {want}m",
@@ -925,7 +1027,7 @@ mod tests {
 
     use crate::test_support::{assert_isolated, TestDir};
 
-    const BBOX: (f64, f64, f64, f64) = (31.230, 121.473, 31.240, 121.484);
+    const BBOX: (f64, f64, f64, f64) = (31.230, 101.473, 31.240, 101.484);
 
     /// 路网缓存的读写必须全部落在**注入目录**里，并在首次写时自动建目录。
     #[test]

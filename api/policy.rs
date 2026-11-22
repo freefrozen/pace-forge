@@ -456,7 +456,7 @@ mod pace_range_tests {
         let pts: Vec<crate::track::TrackPoint> = (0..200)
             .map(|i| crate::track::TrackPoint {
                 lat: 31.2304 + i as f64 * 10.0 / 111_320.0,
-                lon: 121.4737,
+                lon: 101.4737,
                 time_ms: 1_790_000_000_000 + i as i64 * 4000,
             })
             .collect();

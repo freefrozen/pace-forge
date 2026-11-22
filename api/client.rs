@@ -17,6 +17,36 @@ use crate::crypto::envelope::{seal, SessionKeys};
 use sha2::{Digest, Sha256};
 use crate::crypto::{decrypt, sign::token_sign, SignFields};
 
+/// 可选硬件标识头的开关：`PACE_DEVICE_HW_HEADERS=empty` 时发空串。
+///
+/// 只影响 androidId / blMac / wifiMac / IMEI 四个头；DeviceId 与
+/// CustomDeviceId 不在此列——前者是设备锁，后者本来就是客户端自造值。
+fn hw_id(value: &str) -> String {
+    match std::env::var("PACE_DEVICE_HW_HEADERS").ok().as_deref() {
+        Some("empty") => String::new(),
+        _ => value.to_string(),
+    }
+}
+
+/// IMEI 的 Luhn 校验位。
+///
+/// 从右往左数第二位开始，每隔一位翻倍，超过 9 就减 9 再求和；校验位是
+/// 让总和被 10 整除的那个数字。前 14 位传入，返回第 15 位。
+fn luhn_check_digit(body: &[u8]) -> u8 {
+    let mut sum: u32 = 0;
+    for (i, d) in body.iter().rev().enumerate() {
+        let mut v = *d as u32;
+        if i % 2 == 0 {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+    }
+    ((10 - sum % 10) % 10) as u8
+}
+
 /// 设备指纹。首次运行随机生成后应持久化，否则容易被判为异常设备。
 #[derive(Debug, Clone)]
 pub struct DeviceProfile {
@@ -32,9 +62,10 @@ pub struct DeviceProfile {
     pub user_agent: String,
     /// 安卓安装 ID：真机是 16 位小写 hex。
     ///
-    /// 原来一个都没有。真机这八项是从系统 API 直接读的，服务端把它们当
-    /// 设备指纹的一部分；缺失时不会直接拒单，而是在采样点维度打上
-    /// 「来源可疑」的兜底标记——排查时很容易一路追到轨迹上去。
+    /// 真机这八项是从系统 API 直接读的，服务端把它们当设备指纹的一部分。
+    /// 「缺失会被打上来源可疑标记」这条**没有证据**——既没有客户端逻辑、
+    /// 也没有回执或对照实验支撑，只有同类工具的口头经验（issue #17 还给了
+    /// 反例：官方客户端这些请求头常为空串）。按未验证假设处理，别当协议规则。
     pub android_id: String,
     /// 蓝牙 MAC（大写下划线分隔以外的常见形式）。
     pub bl_mac: String,
@@ -42,8 +73,6 @@ pub struct DeviceProfile {
     pub wifi_mac: String,
     /// 设备 IMEI。协议允许空串，但真机读得到。
     pub imei: String,
-    /// 网卡 MAC（登录 body 里的 `mac_address`）。
-    pub mac_address: String,
     /// App 安装时间（毫秒）。必须跨请求稳定，每次变等于自报改机。
     pub app_install_time: i64,
     /// App 上次更新时间（毫秒）。
@@ -65,6 +94,9 @@ impl DeviceProfile {
     pub(crate) fn for_account_in(base: &std::path::Path, scope: &str) -> Self {
         let device_id = persistent_device_id_in(base, scope);
         let mut d = Self { device_id: device_id.clone(), ..Self::base() };
+        // 账号级机型：设了就发 SoC 型号，没设仍然是 ABI（与历史行为一致）。
+        // device_id 不参与这次计算，所以换机型不会换设备。
+        d.cpu_model = resolve_cpu_model(device_model_in(base, scope).as_deref());
         d.fill_derived_identity(&device_id);
         d
     }
@@ -103,14 +135,28 @@ impl DeviceProfile {
         };
         self.wifi_mac = mac("wifi", ":");
         self.bl_mac = mac("bt", ":");
-        self.mac_address = mac("nic", ":");
-        // IMEI 十五位数字，TAC 前缀取常见值
-        let digits: String = h("imei")
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .take(15)
+        // IMEI：15 位数字 = TAC 8 位 + 序列号 6 位 + Luhn 校验位 1 位。
+        //
+        // 原来取 15 个数字再加 "86" 前缀，`0<13` 只补不截，得到 17 位——
+        // 任何长度或 Luhn 校验面前都是非法值（issue #16）。这里前 14 位
+        // 固定以 "86" 开头，其余从摘要取，最后一位按 Luhn 算出来。
+        let mut body: Vec<u8> = vec![8, 6];
+        body.extend(
+            h("imei")
+                .chars()
+                .filter_map(|c| c.to_digit(10))
+                .take(12)
+                .map(|d| d as u8),
+        );
+        while body.len() < 14 {
+            body.push(0);
+        }
+        let check = luhn_check_digit(&body);
+        self.imei = body
+            .iter()
+            .chain(std::iter::once(&check))
+            .map(|d| d.to_string())
             .collect();
-        self.imei = format!("86{digits:0<13}");
         // 安装/更新时间：从 device_id 派生一个落在 2023-2024 的固定时刻
         let base = 1_690_000_000_000i64; // 2023-07
         let off: i64 = u32::from_str_radix(&h("inst")[..8], 16).unwrap_or(0) as i64;
@@ -127,7 +173,7 @@ impl DeviceProfile {
             logic_pixel: "393x873".into(),
             is_root: "0".into(),
             os_type: "0".into(),
-            cpu_model: "arm64-v8a".into(),
+            cpu_model: crate::api::device_table::cpu_model_from_env(),
             device_name: "Android Device".into(),
             os_version: "13".into(),
             user_agent: "okhttp/4.12.0".into(),
@@ -135,7 +181,6 @@ impl DeviceProfile {
             bl_mac: String::new(),
             wifi_mac: String::new(),
             imei: String::new(),
-            mac_address: "02:00:00:00:00:00".into(),
             app_install_time: 0,
             app_update_time: 0,
             custom_device_id: String::new(),
@@ -172,6 +217,70 @@ pub fn uuid_v4() -> String {
 /// 文件——早期版本就是这么放的，改了会让所有老用户被判成新设备（10121）。
 ///
 /// **纯路径计算，不碰磁盘。** 测试用它把路径注入到一次性临时目录。
+/// 账号级机型配置文件：`<base>/.pace-forge-device-model-<hash>`，内容是
+/// model code（或平台代号）一行纯文本，空表示不指定（cpuModel 发 ABI）。
+///
+/// 为什么按账号而不是环境变量：`PACE_*` 是**进程级**的，Web 多账号会共用
+/// 同一个机型，等于所有账号同一台手机；而设备身份本来就该一账号一台。
+pub(crate) fn device_model_path_in(base: &std::path::Path, scope: &str) -> std::path::PathBuf {
+    let name = if scope.is_empty() {
+        ".pace-forge-device-model".to_string()
+    } else {
+        format!(".pace-forge-device-model-{}", short_hash(scope))
+    };
+    base.join(name)
+}
+
+/// 读账号级机型。没有配置文件、或文件里是空串都返回 `None`。
+pub(crate) fn device_model_in(base: &std::path::Path, scope: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(device_model_path_in(base, scope)).ok()?;
+    let t = raw.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// 写账号级机型。`None` 或空串表示清掉（回到 ABI）。
+pub fn save_account_model(scope: &str, model: Option<&str>) -> Result<(), String> {
+    let base = crate::api::session::home_dir();
+    save_account_model_in(&base, scope, model)
+}
+
+pub(crate) fn save_account_model_in(
+    base: &std::path::Path,
+    scope: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let path = device_model_path_in(base, scope);
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => crate::api::session::write_file_private(&path, m.as_bytes()),
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("清机型配置失败 {}: {e}", path.display())),
+        },
+    }
+}
+
+/// 当前账号的机型配置（给 Web 界面显示用）。
+pub fn account_model(scope: &str) -> Option<String> {
+    device_model_in(&crate::api::session::home_dir(), scope)
+}
+
+/// 机型 code / 平台代号 → 实际发出去的 cpuModel。查不到就是 ABI。
+pub fn resolve_cpu_model(model: Option<&str>) -> String {
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .and_then(|m| {
+            crate::api::device_table::soc_for_model(m)
+                .or_else(|| crate::api::device_table::soc_for_platform(m).map(str::to_string))
+        })
+        .unwrap_or_else(|| crate::api::device_table::ABI_FALLBACK.to_string())
+}
+
 pub(crate) fn device_id_path_in(base: &std::path::Path, scope: &str) -> std::path::PathBuf {
     let name = if scope.is_empty() {
         ".pace-forge-device-id".to_string()
@@ -250,9 +359,9 @@ impl Client {
             device,
             creds: Credentials::default(),
             require_signature: false,
-            agent: ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(20))
-                .build(),
+            // 提交链路统一从这里建 agent：设了 PACE_EGRESS_PROXY 就走代理，
+            // 没设与以前逐字节等价。见 api/egress.rs 顶部说明。
+            agent: crate::api::egress::agent(std::time::Duration::from_secs(20)),
         }
     }
 
@@ -295,12 +404,15 @@ impl Client {
             ("User-Agent".into(), self.device.user_agent.clone()),
             ("timeStamp".into(), now_ms.to_string()),
             ("nonce".into(), nonce),
-            // 真机从系统 API 读的八项设备指纹。缺这些不会直接拒单，但服务
-            // 端会把整次 run 的采样点打上「来源可疑」的兜底标记。
-            ("androidId".into(), self.device.android_id.clone()),
-            ("blMac".into(), self.device.bl_mac.clone()),
-            ("wifiMac".into(), self.device.wifi_mac.clone()),
-            ("IMEI".into(), self.device.imei.clone()),
+            // 可选硬件标识：官方客户端有整段空串的会话（issue #17 的 59 条
+            // 请求里五项全空），所以「发空」是一种真实状态；但空与派生各有
+            // 风险，默认保持派生——同一台设备一半头有值一半空，比全空更像
+            // 拼出来的。要拿对照数据时设 PACE_DEVICE_HW_HEADERS=empty，
+            // 四个硬件头一起清空，DeviceId 不动（它是设备锁，不参与这条实验）。
+            ("androidId".into(), hw_id(&self.device.android_id)),
+            ("blMac".into(), hw_id(&self.device.bl_mac)),
+            ("wifiMac".into(), hw_id(&self.device.wifi_mac)),
+            ("IMEI".into(), hw_id(&self.device.imei)),
             ("appInstallTime".into(), self.device.app_install_time.to_string()),
             ("appUpdateTime".into(), self.device.app_update_time.to_string()),
             ("CustomDeviceId".into(), self.device.custom_device_id.clone()),
@@ -482,6 +594,48 @@ pub fn expect_ok(body: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
     use crate::test_support::{assert_isolated, TestDir};
+
+    /// 硬件头开关：默认派生、设 `empty` 清空，DeviceId 不受影响。
+    #[test]
+    fn hw_headers_switch_only_touches_optional_ids() {
+        // 环境变量是进程级的，测试里设置/清除都只在断言窗口内
+        assert_eq!(hw_id("abc"), "abc");
+        std::env::set_var("PACE_DEVICE_HW_HEADERS", "empty");
+        assert_eq!(hw_id("abc"), "");
+        std::env::remove_var("PACE_DEVICE_HW_HEADERS");
+        assert_eq!(hw_id("abc"), "abc");
+    }
+
+    /// 回归（issue #16）：IMEI 必须 15 位并通过 Luhn。
+    ///
+    /// 原来取 15 个数字再加 "86" 前缀，`0<13` 只补不截，产出 17 位，
+    /// 任何校验面前都是非法值。DeviceId 不受影响，仍是持久化那个。
+    #[test]
+    fn imei_is_15_digits_and_luhn_valid() {
+        let td = TestDir::new("imei");
+        let p = DeviceProfile::for_account_in(td.home(), "scope");
+        assert_eq!(p.imei.len(), 15, "IMEI 位数不对: {}", p.imei);
+        assert!(
+            p.imei.chars().all(|c| c.is_ascii_digit()),
+            "IMEI 含非数字: {}",
+            p.imei
+        );
+        // 整串 Luhn：从右往左第二位起翻倍，总和须被 10 整除。
+        let digits: Vec<u8> = p.imei.chars().map(|c| c as u8 - b'0').collect();
+        let mut sum = 0u32;
+        for (i, d) in digits.iter().rev().enumerate() {
+            let mut v = *d as u32;
+            if i % 2 == 1 {
+                v *= 2;
+                if v > 9 {
+                    v -= 9;
+                }
+            }
+            sum += v;
+        }
+        assert_eq!(sum % 10, 0, "Luhn 校验不通过: {}", p.imei);
+        assert_eq!(luhn_check_digit(&[4, 9, 0, 1, 5, 4, 2, 0, 3, 2, 3, 7, 5, 1]), 8);
+    }
 
     /// 服务端集群故障要在**解密之前**就认出来。
     ///

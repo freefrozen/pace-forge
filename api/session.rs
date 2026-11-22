@@ -81,6 +81,16 @@ pub fn data_dir_in(base: &Path) -> PathBuf {
     base.join(DATA_DIR_NAME)
 }
 
+/// 显式指定的数据目录（`PACE_FORGE_DATA_DIR`）。
+///
+/// 设了就用它，**不再追加 `.pace-forge`**——用户给的是「数据放哪儿」，不是
+/// 「HOME 在哪儿」。多实例、把凭证放加密盘、CI 隔离都靠这个开关。
+pub fn data_dir_override() -> Option<PathBuf> {
+    std::env::var_os("PACE_FORGE_DATA_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// 数据目录：`<用户主目录>/.pace-forge/`。
 ///
 /// 只算路径，不做 IO。早先这里带 `create_dir_all`，等于任何一次只读调用
@@ -90,6 +100,9 @@ pub fn data_dir_in(base: &Path) -> PathBuf {
 /// `track::roadnet` 的四类缓存 / `track::tileroad` 的瓦片 / `policy` 的
 /// 调试转储都走它。
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override() {
+        return dir;
+    }
     data_dir_in(&home_dir())
 }
 

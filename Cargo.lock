@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "pace-forge"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "aes",
  "base64",

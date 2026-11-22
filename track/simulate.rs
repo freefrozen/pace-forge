@@ -527,7 +527,7 @@ mod tests {
             .map(|i| {
                 (
                     47.3801 + i as f64 * 6.84 / 111_320.0,
-                    123.9502,
+                    103.9502,
                     1_790_000_000_000 + (i as f64 * 4.91 * 1000.0) as i64,
                 )
             })
@@ -667,7 +667,7 @@ mod time_precision_tests {
     fn segments_are_at_least_one_second() {
         let n = 273;
         let pts: Vec<(f64, f64)> = (0..n)
-            .map(|i| (31.2304 + i as f64 * 7.0 / 111_320.0, 121.4737))
+            .map(|i| (31.2304 + i as f64 * 7.0 / 111_320.0, 101.4737))
             .collect();
         let (times, _, _) = retime(&pts, 720, 1_790_000_000_000, 42, &KinParams::default(), 1.39, 8.33);
         assert_eq!(times.len(), n);
@@ -688,7 +688,7 @@ mod time_precision_tests {
     fn slow_segments_still_have_one_second() {
         let n = 400;
         let pts: Vec<(f64, f64)> = (0..n)
-            .map(|i| (31.2304 + i as f64 * 5.0 / 111_320.0, 121.4737))
+            .map(|i| (31.2304 + i as f64 * 5.0 / 111_320.0, 101.4737))
             .collect();
         // 2 公里跑 40 分钟 = 0.83 m/s，接近下限
         let (times, _, _) = retime(&pts, 2400, 1_790_000_000_000, 7, &KinParams::default(), 0.5, 2.0);

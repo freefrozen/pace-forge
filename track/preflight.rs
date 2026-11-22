@@ -449,6 +449,27 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
         ));
     }
 
+
+    // ── 起步窗口的外推范围 ──
+    //
+    // 起步窗口按总时长的 15.5% 算，这个比例只来自一份 555 秒的真机样本
+    // （窗口 86 秒）。更长的记录没有对照，外推出来的秒数、以及那段时间里
+    // 该有多少个零速度点，都没有实测撑着。只提示、不拦：拦了等于拿推测
+    // 当判据，反而会挡住本来能提交的记录。
+    if c.total_time_sec > 0 {
+        let window = super::startup_sec(c.total_time_sec);
+        let sample_cap = super::startup_sec(555);
+        if window > sample_cap {
+            issues.push(Issue::info(
+                "STARTUP_EXTRAPOLATED",
+                format!(
+                    "总时长 {}s 的起步窗口按 15.5% 外推为 {window}s，超过 86s 的部分没有真机样本",
+                    c.total_time_sec
+                ),
+            ));
+        }
+    }
+
     Report { issues }
 }
 
@@ -727,6 +748,27 @@ mod tests {
         let r = inspect(&c);
         assert!(r.blocked());
         assert!(r.issues.iter().any(|i| i.code == "BUCKET_STEPS"));
+    }
+
+    #[test]
+    fn long_run_gets_startup_extrapolation_note() {
+        let (pts, sim, sp) = sample();
+        let mut c = check(&pts, &sim, &sp, &[]);
+        c.total_time_sec = 555;
+        assert!(
+            !inspect(&c).issues.iter().any(|i| i.code == "STARTUP_EXTRAPOLATED"),
+            "555 秒正好是样本本身的时长，不该提示外推"
+        );
+        c.total_time_sec = 1800;
+        let r = inspect(&c);
+        let hit = r
+            .issues
+            .iter()
+            .find(|i| i.code == "STARTUP_EXTRAPOLATED")
+            .expect("1800 秒应提示起步窗口外推");
+        // 只验这条本身是 Info；强行改时长会让时间轴那些检查同时报致命，
+        // 那是测试构造的副作用，不代表这条会拦提交。
+        assert_eq!(hit.level, Level::Info, "只提示，不阻断");
     }
 
     #[test]

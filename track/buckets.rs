@@ -495,7 +495,7 @@ mod speed_bucket_coverage_tests {
         let pts: Vec<(f64, f64, i64)> = (0..273)
             .map(|i| {
                 let t = 1_790_000_000_000 + i as i64 * 2640;
-                (31.2304 + i as f64 * 7.0 / 111_320.0, 121.4737, t)
+                (31.2304 + i as f64 * 7.0 / 111_320.0, 101.4737, t)
             })
             .collect();
         let total: f64 = pts
@@ -519,7 +519,7 @@ mod speed_bucket_coverage_tests {
         let pts: Vec<(f64, f64, i64)> = (0..273)
             .map(|i| {
                 let t = 1_790_000_000_000 + i as i64 * 2640;
-                (31.2304 + i as f64 * 7.0 / 111_320.0, 121.4737, t)
+                (31.2304 + i as f64 * 7.0 / 111_320.0, 101.4737, t)
             })
             .collect();
         let b = speed_buckets(&pts, 1_790_000_000_000, 720);

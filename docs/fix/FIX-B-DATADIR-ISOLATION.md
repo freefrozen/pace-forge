@@ -194,12 +194,12 @@ drwx------.  3 root root  3440 Nov 13 12:59 .pace-forge
 drwx------. 11 root root  3440 Nov 11 03:26 pace-forge
 ea579eaadaa7dad434b56e89541ec8ed  /root/.pace-forge/accounts.json
 9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/blockers.json
-9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/buildings-47.379_123.951_47.389_123.964.json
-c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_123.950_47.390_123.964.json
-c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_123.951_47.389_123.963.json
+9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/buildings-47.379_103.951_47.389_103.964.json
+c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_103.950_47.390_103.964.json
+c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_103.951_47.389_103.963.json
 23977d7fcfeb742040f31c1a6e1ada3d  /root/.pace-forge/session.json
-9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_123.951_47.389_123.963.json
-9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_123.951_47.389_123.964.json
+9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_103.951_47.389_103.963.json
+9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_103.951_47.389_103.964.json
 dbc6b741d5c3441a867c5678118cfc1a  /root/.pace-forge-device-id
 ff5d5e704abd8e09e1089a3246312fab  /root/.pace-forge-device-id-80d1c979
 fe5fe3ccc9f7218b5af3d0ec2153a582  /root/.pace-forge-device-id-9e0dc928

@@ -40,8 +40,41 @@ impl State {
     }
 
     /// 从磁盘恢复所有账号的登录态。
+    ///
+    /// 两条来源都要看：登录成功时会写 `session.json`，但 `accounts.json` 里那一
+    /// 条不一定已经跟上（uid/token 为空）。只看 book 的话，重启一次就掉登录，
+    /// 用户得重新过一次极验——而 session.json 里明明有完整 token。
     fn restore() -> Self {
-        let book = crate::api::accounts::load();
+        let mut book = crate::api::accounts::load();
+        let sess = crate::api::session::load_session();
+        if !sess.uid.is_empty() && !sess.token.is_empty() {
+            let matched = book
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == sess.uid || (!a.username.is_empty() && a.name == sess.name));
+            if let Some(a) = matched {
+                if !a.logged_in() {
+                    a.uid = sess.uid.clone();
+                    a.token = sess.token.clone();
+                    a.unid = sess.unid.clone();
+                }
+            } else {
+                // 账号库里没有对应条目（旧版本只存了 session），补一条，密码留空
+                book.accounts.push(crate::api::accounts::Account {
+                    id: sess.uid.clone(),
+                    username: sess.username.clone(),
+                    password_enc: String::new(),
+                    uid: sess.uid.clone(),
+                    token: sess.token.clone(),
+                    unid: sess.unid.clone(),
+                    name: sess.name.clone(),
+                    school: sess.campus_name.clone(),
+                    last_login_ms: 0,
+                    last_submit_ms: 0,
+                    enabled: true,
+                });
+            }
+        }
         let mut clients = std::collections::HashMap::new();
         for a in &book.accounts {
             if a.logged_in() {
@@ -57,6 +90,37 @@ impl State {
             println!("[web] 恢复 {} 个账号，当前={id}", clients.len());
         }
         Self { book, clients, current }
+    }
+
+    /// 改了设备字段（机型）之后重建这个账号的 client：下一次请求就带新 cpuModel。
+    ///
+    /// 只重建 clients 里的条目，不动 book 里的凭据——设备字段和登录态是两回事。
+    fn rebuild_client(&mut self, uid: &str) {
+        let found = self
+            .book
+            .accounts
+            .iter()
+            .find(|a| a.id == uid || a.username == uid)
+            .map(|a| (a.id.clone(), a.uid.clone(), a.token.clone(), a.unid.clone()));
+        if let Some((id, u, t, un)) = found {
+            self.clients.insert(id, make_client(&u, &t, &un));
+        }
+    }
+
+    /// 全部账号重建 client（改出口后调用）。返回重建个数。
+    fn rebuild_all_clients(&mut self) -> usize {
+        let list: Vec<(String, String, String, String)> = self
+            .book
+            .accounts
+            .iter()
+            .map(|a| (a.id.clone(), a.uid.clone(), a.token.clone(), a.unid.clone()))
+            .collect();
+        let mut n = 0;
+        for (id, u, t, un) in list {
+            self.clients.insert(id, make_client(&u, &t, &un));
+            n += 1;
+        }
+        n
     }
 
     /// 当前账号。
@@ -187,12 +251,38 @@ fn auth_token() -> Option<String> {
 }
 
 /// 请求来源是否本机。
+///
+/// 覆盖整个 `127.0.0.0/8`、`::1`，以及 IPv4-mapped 形态 `::ffff:127.x.x.x`：
+/// 服务绑在 `[::]` 时，本机用 IPv4 回环访问，对端看到的正是 mapped 地址。
+/// 早先只精确匹配了 `::ffff:127.0.0.1` 一个值，`127.0.0.2` 这类会被误判成远程。
 fn is_loopback(remote: &str) -> bool {
-    let r = remote.trim();
-    r.starts_with("127.")
-        || r.starts_with("::1")
-        || r.starts_with("[::1]")
-        || r == "::ffff:127.0.0.1"
+    use std::net::IpAddr;
+    let r = remote.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = r.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
+    }
+    // 解析不出来时退回字符串判据（宁可严格）
+    r.starts_with("127.") || r == "::1"
+}
+
+/// 口令比较，走常量时间。
+///
+/// 直接 `==` 在第一个不同的字节就返回，同网段攻击者能从响应时间差里逐字节
+/// 试探口令。两边先摘成 SHA-256 再逐字节 XOR 累加，比较路径与内容无关。
+fn ct_eq(got: &str, want: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let a = Sha256::digest(got.as_bytes());
+    let b = Sha256::digest(want.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 鉴权通过返回 Ok，否则返回 Err(要回给客户端的话)。
@@ -218,7 +308,7 @@ fn check_auth(request: &tiny_http::Request, path: &str, query: &str) -> Result<(
                 .find_map(|kv| kv.strip_prefix("token="))
                 .map(url_decode);
             let got = from_header.or(from_query).unwrap_or_default();
-            if got == want {
+            if ct_eq(&got, &want) {
                 Ok(())
             } else {
                 Err("缺少或错误的口令（X-Pace-Token）".into())
@@ -277,6 +367,34 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// 同时在处理的请求上限。
+///
+/// 控制台是本机工具，几十个并发已经远超正常使用。绑 `0.0.0.0` 暴露到局域网
+/// 后，扫描器或慢速连接会一条条堆线程（tiny_http 没有读超时），线程数无上限
+/// 时内存跟着涨。超限直接回 503，让新连接快速失败，而不是继续排队。
+const MAX_INFLIGHT: usize = 64;
+
+static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 请求处理名额：拿到才算被允许起线程，线程结束自动归还。
+struct InflightGuard;
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn try_admit() -> Option<InflightGuard> {
+    let prev = INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if prev >= MAX_INFLIGHT {
+        INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    } else {
+        Some(InflightGuard)
+    }
+}
+
 pub fn serve(addr: &str) -> Result<(), String> {
     let server = Server::http(addr).map_err(|e| format!("监听 {addr} 失败: {e}"))?;
     let state: Shared = Arc::new(Mutex::new(State::restore()));
@@ -292,8 +410,21 @@ pub fn serve(addr: &str) -> Result<(), String> {
     println!("按 Ctrl+C 停止");
 
     for request in server.incoming_requests() {
+        let Some(slot) = try_admit() else {
+            eprintln!("请求超过 {MAX_INFLIGHT} 个在跑，直接回 503");
+            let _ = request.respond(
+                Response::from_string("{\"error\":\"控制台繁忙，请稍后重试\"}")
+                    .with_status_code(503)
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json; charset=utf-8")
+                            .expect("静态头合法"),
+                    ),
+            );
+            continue;
+        };
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
+            let _slot = slot;
             // 单个请求里的 panic 只杀这一个线程，不带走整个进程和正在跑的批次。
             // 之前 release 配的是 panic="abort"，一处 unwrap 失败就等于全崩。
             let guard = std::panic::AssertUnwindSafe(|| handle(request, state));
@@ -444,6 +575,21 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
         (Method::Get, "/api/fences") => handle_fences(request, state, &query),
         (Method::Get, "/api/points") => handle_points(request, state, &query),
         (Method::Get, "/api/records") => handle_records(request, state, &query),
+        (Method::Post, "/api/egress") => {
+            let body = match read_json(&mut request) {
+                Ok(v) => v,
+                Err(e) => return json_err_code(request, 400, &e),
+            };
+            handle_egress_put(request, state, &body)
+        }
+        (Method::Get, "/api/device") => handle_device_get(request, state, &query),
+        (Method::Post, "/api/device") => {
+            let body = match read_json(&mut request) {
+                Ok(v) => v,
+                Err(e) => return json_err_code(request, 400, &e),
+            };
+            handle_device_put(request, state, &body)
+        }
         (Method::Get, "/api/cheat") => handle_cheat(request, state, &query),
         // 风控体检 + 今日建议：面板上那块「体检/建议」卡用的就是这个。
         (Method::Get, "/api/check") => handle_check(request, state),
@@ -479,11 +625,13 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
             handle_raw(request, state, &body)
         }
         (Method::Get, "/api/health") => json_ok(request, json!({"ok": true, "version": crate::VERSION})),
-        // 出口 IP 自检（#10）：显示提交时服务端用的公网 IP，不伪造、不选路。
+        // 出口 IP 自检（#10）：显示提交时服务端用的公网 IP，并标出是否走了代理。
         // 探测失败返回 ok:false，前端显示「出口未知」，不阻塞任何功能。
         (Method::Get, "/api/egress-ip") => {
             json_ok(request, crate::api::egress::cached_json())
         }
+        // 网络自检：生成卡住时用来回答「哪条链路不通」，只探连通性。
+        (Method::Get, "/api/netcheck") => handle_netcheck(request),
         _ => {
             if let Some(rest) = path.strip_prefix("/api/accounts/") {
                 // /api/accounts/{id}/switch  |  /api/accounts/{id}  (DELETE)
@@ -618,7 +766,7 @@ fn handle_plan(
 
     // 中心点：请求里给的坐标 → 围栏环心 → 明确报错。
     //
-    // 这里原来兜底 `(30.5, 104.0)`（成都）。校区在齐齐哈尔，围栏一旦拉不到
+    // 这里原来兜底 `(30.5, 104.0)`（成都）。校区在东北某平原校区，围栏一旦拉不到
     // 就规划出一条跨省轨迹，用户看到的是「能生成、但点全错」。兜底坐标不该
     // 出现在业务路径上——报错比假轨迹有用。
     //
@@ -681,6 +829,8 @@ fn handle_plan(
                 start_at_ms,
                 custom_path: parse_custom_path(body),
                 alt_range: parse_alt_range(body),
+                prefer_stadium: body["mode"].as_str() == Some("stadium"),
+                prefer_roads: body["preferRoads"].as_bool().unwrap_or(true),
                 ..Default::default()
             };
             let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
@@ -1017,9 +1167,7 @@ fn handle_plan(
     }))
 }
 
-
 // ---------- 记分跑：学期进度 ----------
-
 
 // ---------- 账号管理 ----------
 
@@ -1387,6 +1535,8 @@ fn handle_batch(
             run_mode,
             start_at_ms,
             alt_range: parse_alt_range(body),
+            prefer_stadium: body["mode"].as_str() == Some("stadium"),
+                prefer_roads: body["preferRoads"].as_bool().unwrap_or(true),
             ..Default::default()
         };
 
@@ -1437,7 +1587,6 @@ fn handle_batch(
         "results": results,
     }))
 }
-
 
 // ---------- 补跑时刻 ----------
 
@@ -1856,7 +2005,7 @@ fn handle_run(
 
     // 中心点：请求里没给就用围栏反推。
     //
-    // 这里原来兜底成 `(30.5, 104.0)`（成都），而校区在齐齐哈尔。围栏拉取
+    // 这里原来兜底成 `(30.5, 104.0)`（成都），而校区在东北某平原校区。围栏拉取
     // 一旦失败，闭环就变成「成都 → 各打卡点 → 成都」，规划器报
     // 「最短闭环 1777736m」，用户看到一条跨越半个中国的轨迹。
     //
@@ -1900,6 +2049,8 @@ fn handle_run(
         start_at_ms,
         custom_path,
         alt_range: parse_alt_range(body),
+        prefer_stadium: body["mode"].as_str() == Some("stadium"),
+                prefer_roads: body["preferRoads"].as_bool().unwrap_or(true),
         ..Default::default()
     };
 
@@ -1954,6 +2105,151 @@ fn handle_run(
 /// 但记录列表带了 uuid 和 startTime，拼出 objectKey 就能直接从 OBS 取。
 /// App 自己走不走这条路还没定论，见 docs/notes/TRAJECTORY-DISPLAY.md。
 /// 读本地手绘禁区。
+/// 保存出口配置。改完要重建所有 client——agent 是建 client 时创建的，
+/// 不重建的话新出口要到下次重启才生效。
+fn handle_egress_put(
+    request: tiny_http::Request,
+    state: Shared,
+    body: &Value,
+) -> Result<(), String> {
+    use crate::api::egress;
+    let spec = body["proxy"].as_str().map(str::trim).filter(|p| !p.is_empty());
+    if let Err(e) = egress::save_proxy(spec) {
+        return json_err(request, &e);
+    }
+    let n = {
+        let mut st = lock_state(&state);
+        st.rebuild_all_clients()
+    };
+    json_ok(
+        request,
+        json!({
+            "proxy": egress::current_proxy(),
+            "desc": egress::proxy_description(),
+            "rebuilt": n,
+            "note": if spec.is_some() {
+                "已保存，提交链路下一次请求起走这个出口"
+            } else {
+                "已清除，回到直连"
+            },
+        }),
+    )
+}
+
+/// 当前账号的机型配置（`?q=` 有值时顺带搜官方目录）。
+fn handle_device_get(request: tiny_http::Request, state: Shared, query: &str) -> Result<(), String> {
+    use crate::api::{client, device_table};
+    let (scope, cur_model) = {
+        let st = lock_state(&state);
+        match st.current_account() {
+            Some(a) => (device_scope(&a.id), client::account_model(&device_scope(&a.id))),
+            None => (String::new(), None),
+        }
+    };
+    let cpu = client::resolve_cpu_model(cur_model.as_deref());
+    let hit = cur_model
+        .as_deref()
+        .and_then(device_table::catalog_lookup)
+        .map(|e| {
+            json!({
+                "name": e.name, "brand": e.brand, "codename": e.codename
+            })
+        });
+    let mut out = json!({
+        "scope": scope,
+        "model": cur_model,
+        "cpuModel": cpu,
+        "abiFallback": cpu == device_table::ABI_FALLBACK,
+        "catalogHit": hit,
+        "devices": device_table::catalog().len(),
+    });
+    // 三种查询：?brand= 取该品牌机型；?q= 关键词搜；都没有就列品牌 + 平台。
+    let q = query_param(query, "q").unwrap_or_default();
+    let brand = query_param(query, "brand").unwrap_or_default();
+    let list = if !brand.trim().is_empty() {
+        device_table::models_of_brand(&brand, 300)
+    } else if q.trim().is_empty() {
+        Vec::new()
+    } else {
+        device_table::search_catalog(&q, 12)
+    };
+    let found: Vec<Value> = list
+        .into_iter()
+        .map(|(code, e)| {
+            json!({"model": code, "name": e.name, "brand": e.brand, "codename": e.codename})
+        })
+        .collect();
+    out["results"] = json!(found);
+    if brand.trim().is_empty() && q.trim().is_empty() {
+        let brands: Vec<Value> = device_table::brands()
+            .into_iter()
+            .map(|(name, count)| json!({"name": name, "count": count}))
+            .collect();
+        let platforms: Vec<Value> = device_table::platforms()
+            .into_iter()
+            .map(|(code, soc, name, vendor)| {
+                json!({"code": code, "soc": soc, "name": name, "vendor": vendor})
+            })
+            .collect();
+        out["brands"] = json!(brands);
+        out["platforms"] = json!(platforms);
+        out["suggested"] = json!(device_table::suggested(9)
+            .into_iter()
+            .map(|(code, e)| json!({"model": code, "name": e.name, "brand": e.brand}))
+            .collect::<Vec<_>>());
+    }
+    json_ok(request, out)
+}
+
+/// 设置当前账号的机型。`model` 为空/null 表示清掉（回到 ABI）。
+fn handle_device_put(request: tiny_http::Request, state: Shared, body: &Value) -> Result<(), String> {
+    use crate::api::client;
+    let scope = {
+        let st = lock_state(&state);
+        match st.current_account() {
+            Some(a) => device_scope(&a.id),
+            None => return json_err(request, "请先登录再设置机型"),
+        }
+    };
+    let model = body["model"].as_str().map(str::trim).filter(|m| !m.is_empty());
+    if let Some(m) = model {
+        if m.len() > 64 || m.chars().any(|c| c.is_control()) {
+            return json_err(request, "机型 code 不合法（最长 64，不能含控制字符）");
+        }
+    }
+    // 给了平台代号就顺手记一条用户级映射（内置表查不到 SoC 时用得上）
+    if let (Some(m), Some(plat)) = (
+        model,
+        body["platform"].as_str().map(str::trim).filter(|p| !p.is_empty()),
+    ) {
+        if let Err(e) = crate::api::device_table::set_user_model(m, plat) {
+            return json_err(request, &e);
+        }
+    }
+    if let Err(e) = client::save_account_model(&scope, model) {
+        return json_err(request, &e);
+    }
+    // 重建当前 client，让新的 cpuModel 立刻生效（下一次请求就是新机型）
+    {
+        let mut st = lock_state(&state);
+        st.rebuild_client(&scope);
+    }
+    let cpu = client::resolve_cpu_model(model);
+    let hit = model.and_then(crate::api::device_table::catalog_lookup).map(|e| {
+        json!({"name": e.name, "brand": e.brand, "codename": e.codename})
+    });
+    json_ok(
+        request,
+        json!({
+            "model": model,
+            "cpuModel": cpu,
+            "abiFallback": cpu == crate::api::device_table::ABI_FALLBACK,
+            "catalogHit": hit,
+            "note": "只改 cpuModel，不改 device_id；已生效到下一次请求"
+        }),
+    )
+}
+
 fn handle_blockers_get(request: tiny_http::Request) -> Result<(), String> {
     let polys = crate::track::roadnet::load_local_blockers();
     json_ok(
@@ -2267,7 +2563,7 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         let mut it = pair.splitn(2, '=');
         let k = it.next()?;
         if k == key {
-            it.next().map(|v| v.to_string())
+            it.next().map(url_decode)
         } else {
             None
         }
@@ -2301,6 +2597,102 @@ fn lock_state(state: &Shared) -> std::sync::MutexGuard<'_, State> {
         eprintln!("! [state] 状态锁已中毒（有线程持锁时 panic 过），强制恢复继续");
         e.into_inner()
     })
+}
+
+/// `application/x-www-form-urlencoded` 的最小百分号编码（只用于自检查询串）。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn host_short(host: &str) -> String {
+    host.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(host)
+        .to_string()
+}
+
+/// 网络自检：分别探 Overpass 三个端点和高德瓦片，各自报耗时与错误。
+///
+/// 生成轨迹卡在「拉路网 / 建筑 / 瓦片」时，最需要回答的是「到底哪条不通」。
+/// 这里只做连通性探测（一个空 bbox 的极小查询、一张瓦片），不参与生成，
+/// 也不写缓存，失败不影响任何功能。
+fn handle_netcheck(request: tiny_http::Request) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    let mut items: Vec<Value> = Vec::new();
+
+    // Overpass：空 bbox 查询，只验证能否拿到 elements。
+    let enc = percent_encode("[out:json][timeout:5];node(0,0,0.01,0.01);out;");
+    for host in crate::track::roadnet::OVERPASS_HOSTS {
+        let t0 = Instant::now();
+        let (ok, detail) = match ureq::get(&format!("{host}?data={enc}"))
+            .set("User-Agent", "pace-forge/0.1 (netcheck)")
+            .timeout(Duration::from_secs(8))
+            .call()
+        {
+            Ok(r) => match r.into_string() {
+                Ok(t) if t.contains("\"elements\"") => (true, "连通".to_string()),
+                Ok(_) => (false, "返回内容异常".to_string()),
+                Err(e) => (false, format!("读取失败: {e}")),
+            },
+            Err(e) => (false, format!("{e}")),
+        };
+        items.push(json!({
+            "name": format!("Overpass {}", host_short(host)),
+            "ok": ok,
+            "ms": t0.elapsed().as_millis() as u64,
+            "detail": detail
+        }));
+    }
+
+    // 高德瓦片：拿一张固定瓦片（北京附近），只验证能不能下载到图。
+    let tile = "https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=3360&y=1558&z=17";
+    let t0 = Instant::now();
+    let (ok, detail) = match ureq::get(tile)
+        .set("User-Agent", "Mozilla/5.0 (compatible; pace-forge/0.1)")
+        .set("Referer", "https://www.amap.com/")
+        .timeout(Duration::from_secs(6))
+        .call()
+    {
+        Ok(r) => {
+            use std::io::Read as _;
+            let mut rd = r.into_reader().take(4096);
+            let mut buf = Vec::new();
+            match rd.read_to_end(&mut buf) {
+                Ok(_) if buf.len() > 512 => (true, "连通".to_string()),
+                Ok(_) => (false, "返回内容过短（可能被拦截）".to_string()),
+                Err(e) => (false, format!("读取失败: {e}")),
+            }
+        }
+        Err(e) => (false, format!("{e}")),
+    };
+    items.push(json!({
+        "name": "高德瓦片 webrd01",
+        "ok": ok,
+        "ms": t0.elapsed().as_millis() as u64,
+        "detail": detail
+    }));
+
+    let all_ok = items.iter().all(|i| i["ok"].as_bool().unwrap_or(false));
+    let hint = if all_ok {
+        "链路都通：卡住就不是网络问题，看结果面板里的「[耗时]」行定位在哪一段"
+    } else {
+        "有一项不通：对应那一步会等满超时才放弃，生成因此变慢；日志里的 [roads]/[block]/[tiles] 就是它"
+    };
+    json_ok(
+        request,
+        json!({"allOk": all_ok, "hint": hint, "items": items, "version": crate::VERSION}),
+    )
 }
 
 fn json_ok(request: tiny_http::Request, body: Value) -> Result<(), String> {
@@ -2465,6 +2857,23 @@ mod origin_tests {
 }
 
 #[cfg(test)]
+mod url_decode_tests {
+    use super::url_decode;
+
+    #[test]
+    fn decodes_space_plus_and_percent() {
+        assert_eq!(url_decode("xiaomi%2013"), "xiaomi 13");
+        assert_eq!(url_decode("xiaomi+13"), "xiaomi 13");
+        assert_eq!(url_decode("2211133C"), "2211133C");
+        // 中文（UTF-8 多字节）
+        assert_eq!(url_decode("%E5%B0%8F%E7%B1%B3"), "小米");
+        // 坏的转义原样留着，不 panic
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("%zz"), "%zz");
+    }
+}
+
+#[cfg(test)]
 mod device_scope_tests {
     use super::device_scope;
 
@@ -2498,8 +2907,8 @@ mod fence_coord_tests {
     ///    这条立刻红。
     #[test]
     fn fence_ring_must_be_converted_to_gcj() {
-        // 齐齐哈尔一带（issue 里那位用户的学校）
-        let ring_bd = [(47.3794, 123.9502), (47.3800, 123.9510), (47.3790, 123.9520)];
+        // 东北某平原校区一带（issue 里那位用户的学校）
+        let ring_bd = [(47.3794, 103.9502), (47.3800, 103.9510), (47.3790, 103.9520)];
         let ring_gcj: Vec<(f64, f64)> = ring_bd.iter().map(|&(a, b)| bd09_to_gcj02(a, b)).collect();
 
         assert_eq!(ring_gcj.len(), ring_bd.len(), "点数不能变");
@@ -2523,7 +2932,7 @@ mod fence_coord_tests {
     /// 精确可逆，那做不到，也不该由这条测试来保证。
     #[test]
     fn fence_ring_roundtrip_rounds_back() {
-        let p = (47.3794, 123.9502);
+        let p = (47.3794, 103.9502);
         let (ga, go) = bd09_to_gcj02(p.0, p.1);
         let (ba, bo) = gcj02_to_bd09(ga, go);
         assert!(
@@ -2577,7 +2986,7 @@ mod center_input_tests {
     /// 不转换的代价。若哪天有人把转换删了，这条会立刻炸。
     #[test]
     fn each_coord_system_lands_somewhere_different() {
-        let (lat, lng) = (47.3864, 123.9586);
+        let (lat, lng) = (47.3864, 103.9586);
         let gcj = input_to_bd09(lat, lng, "gcj02").unwrap();
         let wgs = input_to_bd09(lat, lng, "wgs84").unwrap();
         let bd = input_to_bd09(lat, lng, "bd09").unwrap();
@@ -2612,8 +3021,70 @@ mod center_input_tests {
     #[test]
     fn unknown_system_falls_back_to_gcj02() {
         // 前端下拉以外的值不该让整个请求炸掉，按最常见的 GCJ-02 处理
-        let a = input_to_bd09(47.3864, 123.9586, "whatever").unwrap();
-        let b = input_to_bd09(47.3864, 123.9586, "gcj02").unwrap();
+        let a = input_to_bd09(47.3864, 103.9586, "whatever").unwrap();
+        let b = input_to_bd09(47.3864, 103.9586, "gcj02").unwrap();
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::is_loopback;
+
+    /// 本机判定必须覆盖整个回环段，包括双栈下 IPv4 的 mapped 形态。
+    #[test]
+    fn loopback_covers_whole_range_and_mapped_ipv4() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+            "::ffff:127.0.0.2",
+        ] {
+            assert!(is_loopback(ok), "{ok} 应判为本机");
+        }
+        for no in ["10.0.0.1", "192.168.1.2", "::ffff:192.168.1.2", "114.114.114.114"] {
+            assert!(!is_loopback(no), "{no} 不该判为本机");
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::ct_eq;
+
+    /// 口令比较只认逐字节全等；前缀相同、长度不同的都不能过。
+    #[test]
+    fn token_compare_is_exact_and_prefix_safe() {
+        let want = "0123456789abcdef0123456789abcdef";
+        assert!(ct_eq(want, want));
+        assert!(!ct_eq(&want[..16], want), "前缀相同不能算相等");
+        assert!(!ct_eq("", want));
+        assert!(!ct_eq(
+            "0123456789abcdef0123456789abcdee",
+            want
+        ));
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::{try_admit, INFLIGHT, MAX_INFLIGHT};
+    use std::sync::atomic::Ordering;
+
+    /// 名额发满后新请求立刻被拒；处理完归还后名额恢复。
+    #[test]
+    fn inflight_cap_is_enforced_and_released() {
+        assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "测试开始时计数应为 0");
+        let mut held = Vec::new();
+        while let Some(g) = try_admit() {
+            held.push(g);
+        }
+        assert_eq!(held.len(), MAX_INFLIGHT, "同时持有的名额应恰好等于上限");
+        assert!(try_admit().is_none(), "满了以后不该再发名额");
+        drop(held);
+        assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "全部归还后计数应归零");
+        assert!(try_admit().is_some(), "归还后应立刻能再拿到名额");
     }
 }

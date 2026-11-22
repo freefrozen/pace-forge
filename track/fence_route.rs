@@ -902,7 +902,7 @@ pub fn route_through_in_order(
         // 弧的鼓出量。
         //
         // 原来是段长的 35%、夹在 30~180m。实测打卡点全是「某栋楼的某方位」
-        // （秋实城东南、梅园2栋西、杏林3栋北…），彼此隔着一两栋楼，
+        // （秋实城东南、2 号楼西、杏林3栋北…），彼此隔着一两栋楼，
         // 180m 的鼓出量会让弧从校园正中兜过去，横穿整片建筑群。
         //
         // 压到段长的 18%、上限 60m：弧只做轻微避让，主体贴近两点连线，
@@ -1163,7 +1163,7 @@ mod tests {
     /// 一个 400m × 300m 的矩形围栏（约 12 公顷）。
     fn rect_fence() -> Vec<(f64, f64)> {
         let lat0 = 31.2300;
-        let lng0 = 121.4700;
+        let lng0 = 101.4700;
         let dlat = 400.0 / m_per_deg_lat(lat0);
         let dlng = 300.0 / m_per_deg_lng(lat0);
         vec![
@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn nudge_outside_keeps_point_count() {
         let lat0 = 31.2300f64;
-        let lng0 = 121.4700f64;
+        let lng0 = 101.4700f64;
         let d = 12.0 / m_per_deg_lat(lat0);
         let clamp_lng = 20.0 / m_per_deg_lng(lat0);
         let poly = vec![
@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn pin_checkpoints_overrides_blocker_avoidance() {
         let lat0 = 31.2300f64;
-        let lng0 = 121.4700f64;
+        let lng0 = 101.4700f64;
         let mlat = m_per_deg_lat(lat0);
         let mlng = m_per_deg_lng(lat0);
 
@@ -1402,7 +1402,7 @@ mod tests {
         // 400m × 300m 的矩形围栏，周长约 1400m
         let mlat = m_per_deg_lat(31.23);
         let mlng = m_per_deg_lng(31.23);
-        let (lat0, lon0) = (31.2304, 121.4737);
+        let (lat0, lon0) = (31.2304, 101.4737);
         let ring: Vec<(f64, f64)> = vec![
             (lat0, lon0),
             (lat0, lon0 + 400.0 / mlng),
@@ -1430,7 +1430,7 @@ mod tests {
     fn in_order_route_preserves_sequence() {
         let mlat = m_per_deg_lat(31.23);
         let mlng = m_per_deg_lng(31.23);
-        let (lat0, lon0) = (31.2304, 121.4737);
+        let (lat0, lon0) = (31.2304, 101.4737);
         let fence: Vec<(f64, f64)> = vec![
             (lat0, lon0),
             (lat0, lon0 + 800.0 / mlng),
@@ -1534,7 +1534,7 @@ mod order_debug_tests {
     fn in_order_route_is_sane_for_campus_scale() {
         let mlat = m_per_deg_lat(47.38);
         let mlng = m_per_deg_lng(47.38);
-        let (lat0, lon0) = (47.37962, 123.95140);
+        let (lat0, lon0) = (47.37962, 103.95140);
         // 1020 × 883 m 的围栏
         let fence = vec![
             (lat0, lon0),
@@ -1649,9 +1649,9 @@ mod order_debug_tests {
 
     #[test]
     fn detour_debug_real_coords() {
-        // 齐齐哈尔校区真实纬度上，一个 30m × 30m 的矩形
+        // 东北某平原校区校区真实纬度上，一个 30m × 30m 的矩形
         let lat = 47.38255;
-        let lng = 123.96670;
+        let lng = 103.96670;
         let dy = 15.0 / 111_000.0;
         let dx = 15.0 / (111_000.0 * 0.677); // cos(47.38°) ≈ 0.677
         let poly = vec![

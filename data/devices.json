@@ -1,0 +1,29 @@
+{
+  "note": "机型 → SoC 表（关 issue #18）。分两层：platforms 是芯片平台代号 → SoC 型号，属于公开命名；models 是具体机型 code 的来源标注，没出处的一条都不要加。补机型的方法见 README「硬件指纹」一节。",
+  "platforms": {
+    "kalama":    {"soc": "SM8550", "name": "骁龙 8 Gen 2", "vendor": "Qualcomm"},
+    "cape":      {"soc": "SM8475", "name": "骁龙 8+ Gen 1", "vendor": "Qualcomm"},
+    "taro":      {"soc": "SM8450", "name": "骁龙 8 Gen 1", "vendor": "Qualcomm"},
+    "lahaina":   {"soc": "SM8350", "name": "骁龙 888", "vendor": "Qualcomm"},
+    "montague":  {"soc": "SM8650", "name": "骁龙 8 Gen 3", "vendor": "Qualcomm"},
+    "pineapple": {"soc": "SM8750", "name": "骁龙 8 Elite", "vendor": "Qualcomm"},
+    "waipio":    {"soc": "SM7325", "name": "骁龙 778G", "vendor": "Qualcomm"},
+    "parrot":    {"soc": "SM6225", "name": "骁龙 680", "vendor": "Qualcomm"},
+    "diwali":    {"soc": "SM6450", "name": "骁龙 6 Gen 1", "vendor": "Qualcomm"},
+    "mt6893":    {"soc": "MT6893", "name": "天玑 1200", "vendor": "MediaTek"},
+    "mt6895":    {"soc": "MT6895", "name": "天玑 8100", "vendor": "MediaTek"},
+    "mt6983":    {"soc": "MT6983", "name": "天玑 9000", "vendor": "MediaTek"},
+    "mt6985":    {"soc": "MT6985", "name": "天玑 9200", "vendor": "MediaTek"},
+    "mt6989":    {"soc": "MT6989", "name": "天玑 9300", "vendor": "MediaTek"},
+    "mt6833":    {"soc": "MT6833", "name": "天玑 700", "vendor": "MediaTek"},
+    "mt6877":    {"soc": "MT6877", "name": "天玑 900", "vendor": "MediaTek"},
+    "mt6789":    {"soc": "MT6789", "name": "Helio G99", "vendor": "MediaTek"}
+  },
+  "models": {},
+  "howto": [
+    "① 真机取：adb shell getprop ro.product.model && adb shell getprop ro.board.platform",
+    "② 写进 models：{\"<ro.product.model>\": {\"platform\": \"<ro.board.platform>\", \"brand\": \"<厂商>\", \"src\": \"<截图/日期/机型来源>\"}}",
+    "③ 校验：pace-forge devices（会打印未收录的机型，不猜）",
+    "④ 只有 platforms 里已有的平台代号才收；新平台先补 platforms 那一层，并写清出处"
+  ]
+}

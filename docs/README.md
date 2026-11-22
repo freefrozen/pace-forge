@@ -26,6 +26,8 @@ tag 复核都得能直接打开。
 | [FIX-SAMPLE-RATE.md](fix/FIX-SAMPLE-RATE.md) | 上报节奏改成 5 秒等时间采样 |
 | [FIXED-POINT-PARITY.md](fix/FIXED-POINT-PARITY.md) | 必到点字段对齐 |
 | [SEGMENT-JSON-PARITY.md](fix/SEGMENT-JSON-PARITY.md) | `segmentJson` 分段对齐 |
+| [SEGMENT-AVGSTEP-RECHECK.md](fix/SEGMENT-AVGSTEP-RECHECK.md) | `segment_json.avgStep` 是段步数还是步频的复核（issue #12） |
+| [FIXED-POINT-MATCH.md](fix/FIXED-POINT-MATCH.md) | 必到点匹配结果类型、`PACE_FIXED_STRICT` 与证据边界（issue #11） |
 | [STARTUP-WINDOW-PARITY.md](fix/STARTUP-WINDOW-PARITY.md) | 起步窗口（GPS 未锁定期）对齐 |
 
 ## notes/ 笔记
@@ -33,8 +35,10 @@ tag 复核都得能直接打开。
 | 文件 | 内容 |
 |---|---|
 | [TYPE9-NOTES.md](notes/TYPE9-NOTES.md) | `type=9` 的观测笔记 |
+| [OBS-FORMAT.md](notes/OBS-FORMAT.md) | OBS 明细对象的 10 个键、gzip→base64 层级、未覆盖项（issue #13） |
 | [TEST-ISOLATION.md](notes/TEST-ISOLATION.md) | 测试隔离的做法 |
 | [TRAJECTORY-DISPLAY.md](notes/TRAJECTORY-DISPLAY.md) | App 里轨迹显示的取数路径 |
+| [CROSSCHECK.md](notes/CROSSCHECK.md) | 跨记录自检：连续天数、起跑时刻集中度、里程离散度、轨迹重合 |
 | [trajectory-status.html](trajectory-status.html) | 轨迹显示状态的一张自测页 |
 
 ## 为什么这些不放进 Releases

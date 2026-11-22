@@ -216,21 +216,21 @@ drwx------.  3 root root  3440 Nov 13 10:20 .
 drwx------. 29 root root  3440 Nov 13 10:22 ..
 -rw-------.  1 root root   377 Nov 13 09:55 accounts.json
 -rw-------.  1 root root    12 Nov 10 15:10 blockers.json
--rw-------.  1 root root    12 Nov 10 15:12 buildings-47.379_123.951_47.389_123.964.json
--rw-------.  1 root root   916 Nov  7 05:40 roads-47.379_123.950_47.390_123.964.json
--rw-------.  1 root root   916 Nov  6 14:54 roads-47.379_123.951_47.389_123.963.json
+-rw-------.  1 root root    12 Nov 10 15:12 buildings-47.379_103.951_47.389_103.964.json
+-rw-------.  1 root root   916 Nov  7 05:40 roads-47.379_103.950_47.390_103.964.json
+-rw-------.  1 root root   916 Nov  6 14:54 roads-47.379_103.951_47.389_103.963.json
 -rw-------.  1 root root   208 Nov 13 10:18 session.json
 drwx------.  2 root root 20480 Nov 12 04:22 tiles
--rw-------.  1 root root    12 Nov  6 14:59 water-47.379_123.951_47.389_123.963.json
--rw-------.  1 root root    12 Nov 10 15:12 water-47.379_123.951_47.389_123.964.json
+-rw-------.  1 root root    12 Nov  6 14:59 water-47.379_103.951_47.389_103.963.json
+-rw-------.  1 root root    12 Nov 10 15:12 water-47.379_103.951_47.389_103.964.json
 3db3d29e274288a87ea0299378e069cb  /root/.pace-forge/accounts.json
 9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/blockers.json
-9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/buildings-47.379_123.951_47.389_123.964.json
-c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_123.950_47.390_123.964.json
-c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_123.951_47.389_123.963.json
+9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/buildings-47.379_103.951_47.389_103.964.json
+c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_103.950_47.390_103.964.json
+c749730801cf144fd208bda6f0cba12f  /root/.pace-forge/roads-47.379_103.951_47.389_103.963.json
 c2f7eb8de7baea3a9959d7fd9b2f0078  /root/.pace-forge/session.json
-9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_123.951_47.389_123.963.json
-9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_123.951_47.389_123.964.json
+9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_103.951_47.389_103.963.json
+9c7e01b0d0fca91ce52fffb6b5bee009  /root/.pace-forge/water-47.379_103.951_47.389_103.964.json
 ```
 
 ## 6. 验证

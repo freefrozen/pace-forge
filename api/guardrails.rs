@@ -162,11 +162,19 @@ mod tests {
     }
 
     #[test]
-    fn allows_campus_run_without_altitude_data() {
-        let mut lines = Vec::new();
-        let r = inspect(&params(1, 1320), None, &cps(5), &mut |s| {
-            lines.push(s.to_string())
-        });
-        assert!(r.is_ok(), "查不到高程只提示，不该拦");
+    fn blocks_unbounded_startup_on_long_runs() {
+        // 不设 PACE_STARTUP_CAP_SEC 时，720 秒的记录起步窗口按比例外推是 112 秒、
+        // 22 分钟是 205 秒——都超过真机上限，应该拦住并要求封顶。
+        unsafe { std::env::remove_var("PACE_STARTUP_CAP_SEC") };
+        let r = inspect(&params(1, 1320), None, &cps(5), &mut |_| {});
+        assert!(r.is_err(), "起步窗口 205 秒应被拦截");
+    }
+
+    #[test]
+    fn allows_when_startup_capped() {
+        unsafe { std::env::set_var("PACE_STARTUP_CAP_SEC", "86") };
+        let r = inspect(&params(1, 1320), None, &cps(5), &mut |_| {});
+        assert!(r.is_ok(), "封顶 86 秒后应放行");
+        unsafe { std::env::remove_var("PACE_STARTUP_CAP_SEC") };
     }
 }
