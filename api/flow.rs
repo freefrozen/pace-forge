@@ -169,6 +169,21 @@ fn try_stadium_track(
         return None;
     }
 
+    // 长宽比保护：环形跑道的长宽比是有上限的——标准 400m 外框 177×92.5
+    // （1.91），校内小场 160×75（2.13），再瘦就不是环了。
+    //
+    // 许昌学院实测 220×38（5.8）：点位沿一条主路排开，落到下面「按比例拟合」
+    // 会造出一个半径 25m、直道 140m 的细长椭圆，绕 5.5 圈——每圈都要把 5 个
+    // 点位重复经过一遍，`point-order` 立刻变成乱序，服务端按「按顺序通过」
+    // 判定直接失败。阈值取 2.5：比任何真实跑道都宽，又拦得住这种细长条。
+    let aspect = major / minor.max(1.0);
+    if aspect > 2.5 {
+        log(&format!(
+            "[track] 打卡点外框 {major:.0}×{minor:.0}m（长宽比 {aspect:.1}）不像环形跑道，改用路线规划"
+        ));
+        return None;
+    }
+
     // 先认标准跑道。
     //
     // 校园里的田径场绝大多数就是标准的，而「打卡点外框 × 系数」这条路
@@ -407,8 +422,9 @@ fn try_route_on_tiles(
     // 「不生硬」交给 soften：横向摆动 + 轻度平滑，让轨迹偏离道路中心线。
     let graph = tileroad::build_graph(&clipped, 25.0);
     let _ = start;
-    let _ = seed;
-    match tileroad::route_through(&graph, must, want_m) {
+    // 带上随机扰动：同一账号连日的记录不能是同一条折线（实测两条程序记录
+    // 重合度 100%，这是最容易被跑批认出来的形态）。
+    match tileroad::route_through_seeded(&graph, must, want_m, seed) {
         Ok(points) => {
             let max_gap = points
                 .windows(2)
@@ -445,6 +461,32 @@ fn try_route_on_tiles(
             None
         }
     }
+}
+
+/// `PACE_DUMP_TRACK` 指定的路径上落一份 `[[lat, lon], ...]`，供轨迹重合度体检。
+///
+/// 只在环境变量存在时写文件，正常跑不受影响（也不写任何敏感字段）。
+fn maybe_dump_track(pts: &[crate::track::TrackPoint]) {
+    let Some(path) = std::env::var_os("PACE_DUMP_TRACK") else {
+        return;
+    };
+    let arr: Vec<[f64; 2]> = pts.iter().map(|p| [p.lat, p.lon]).collect();
+    if let Ok(s) = serde_json::to_string(&arr) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// 解析出真正要用的海拔区间。
+///
+/// 优先级：调用方显式给的 → 环境变量 `PACE_ALT_RANGE` → 按锚点查 DEM 缓存
+/// → `None`（`submit` 里退回 150±8 的老默认，那是齐齐哈尔的值，只当兜底）。
+///
+/// 之所以在这里统一解析：`dry_run` 与真提交各构造一次 `SubmitParams`，
+/// 两处都写 `p.alt_range` 的话，一旦只改一处就会「自检守 A、提交发 B」。
+pub fn effective_alt_range(p: &RunParams) -> Option<(f64, f64)> {
+    p.alt_range
+        .or_else(super::elev::from_env)
+        .or_else(|| super::elev::range_for(p.center_lat, p.center_lng))
 }
 
 impl RunParams {
@@ -842,6 +884,14 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             name: format!("P{}", i + 1),
         })
         .collect();
+    // 提交前硬拦截：参数不自洽（海拔 vs 坐标、跑法 vs 点位、起步窗口过长）。
+    // 2026-11-22 那条被驳回的审核意见是「APP 参数数据异常 201」，规则项全过，
+    // 只有「运动数据有问题」没过——它们的判据在参数自洽上。
+    {
+        let alt_now = effective_alt_range(p);
+        super::guardrails::inspect(p, alt_now, &cps, log)?;
+    }
+
     // 有围栏就在围栏内铺路：早先不管围栏形状，按中心点画固定半径的圆，
     // 围栏一大轨迹就有一半在外面，服务端判越界，整条记录作废（距离 0.00km）。
     let fence_ring: Vec<(f64, f64)> = pick
@@ -1120,12 +1170,15 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         let wandered = if dense {
             // 沿路的骨架是直线段，光跳过圆角会显得又硬又直。磨圆 + 微摆动，
             // 幅度压在路宽以内。
-            crate::track::tileroad::soften(
-                &rounded,
-                2,
-                2.6,
-                if p.seed != 0 { p.seed } else { start_ms as u64 },
-            )
+            // 摆动幅度是「像不像同一条路」的旋钮：
+            // - 2.6m（旧值）→ 每条几乎重合，实测轨迹重合度 90%+；
+            // - 完全随机换路 → 0%，但真人不会每天换一条路，反而更假。
+            // 真实值落在两者之间：同一条主路、每天差 10~30 米（行人、车辆、
+            // 进出校门的位置），换算成重合度大概 60~85%。所以幅度按
+            // start_ms 在 4.0~7.5m 之间抖，波长也跟着变。
+            let sd = if p.seed != 0 { p.seed } else { start_ms as u64 };
+            let amp = 4.0 + (sd % 36) as f64 / 10.0; // 4.0 ~ 7.5m
+            crate::track::tileroad::soften(&rounded, 2, amp, sd)
         } else {
             crate::track::fence_route::add_wander(
                 &rounded,
@@ -1254,7 +1307,44 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         log(&note);
     }
 
-    let xy: Vec<(f64, f64)> = track.points.iter().map(|q| (q.lat, q.lon)).collect();
+    let mut xy: Vec<(f64, f64)> = track.points.iter().map(|q| (q.lat, q.lon)).collect();
+    // ⓹.3 里程校准：把几何折线缩放到目标里程。
+    //
+    // 为什么必须在采样前做：`沿路/沿瓦片规划` 给的是「够长的路」，但吸附打卡点
+    // 会把顶点拽到点位坐标、起步窗口压缩又会重铺弧长，两刀下来实测里程比目标
+    // 短 5% 以上（实测 2414 → 2269）。报文里声明的 `totalDis` 用的是最终几何，
+    // 所以自检能过、服务端也不会驳回——只是**你要 2.4km，发出去只有 2.27km**。
+    // 缩放放在采样之前：点位吸附是之后的事，缩放不会把打卡点拽偏。
+    {
+        let want = p.distance_m;
+        let have = crate::track::geo::path_length(&xy);
+        if want > 100.0 && have > 50.0 {
+            let ratio = want / have;
+            if (ratio - 1.0).abs() > 0.015 {
+                // 打卡点所在的顶点必须钉住——缩放是「以起点为基准按比例放大」，
+                // 不钉住的话离起点 100m 的点位会被挪 5m，`CP_MISS` 立刻拦下
+                // （实测残距 6.2~6.5m，正好是 5% 的缩放量）。
+                let fixed: Vec<usize> = xy
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, q)| {
+                        cps.iter().any(|c| {
+                            crate::track::geo::distance(**q, (c.lat, c.lng)) < 0.5
+                        })
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let (_len, _ok) =
+                    crate::track::geo::scale_to_length(&mut xy, want, &fixed, 1.0);
+                log(&format!(
+                    "√ [length] 几何 {have:.0}m → 目标 {want:.0}m（缩放 {:.1}%）",
+                    (ratio - 1.0) * 100.0
+                ));
+            }
+        }
+    }
+    // 调试/体检：`PACE_DUMP_TRACK=/tmp/x.json` 时把最终上报点落盘，
+    // 用来跟历史记录算轨迹重合度（`pace-forge tracks` 是读服务端的）。
     // 采样点在弧长空间就对齐到打卡点（详见 `track::sample_by_time`）：
     // 5 秒网格的相邻点可以差 20m 以上，事后再靠吸附瞬移会扯出大间隔。
     let cp_pairs: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
@@ -1299,7 +1389,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 采样点能整体挪出几十米；只靠 ⑤.6 的「吸附」（把点直接拽到点位坐标）
     // 去救，位移会大到扯出 40m 的相邻间距。先在**弧长空间**把最近的那个
     // 采样点挪到点位在轨迹上的投影（位移 ≤ 半个步长），吸附只需要收尾。
-    let aligned = crate::track::align_samples_to_checkpoints(&mut track_points, &snap_cps);
+    maybe_dump_track(&track_points);
+    let aligned = crate::track::align_samples_to_checkpoints_ordered(&mut track_points, &snap_cps);
     if aligned > 0 {
         log(&format!("√ [align] 压缩后按轨迹重新对齐打卡点 {aligned} 个"));
     }
@@ -1315,7 +1406,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     //
     // 所以吸附必须放在**压缩之后**（压缩前吸一次没用，会被再打散），而且必须
     // 放在 `real_len` 重算**之前**：吸附会动坐标，totalDis 得跟最终几何同源。
-    let snap = crate::track::snap_checkpoints(&mut track_points, &snap_cps);
+    let snap = crate::track::snap_checkpoints_ordered(&mut track_points, &snap_cps);
     if !snap.items.is_empty() {
         log(&format!(
             "√ [snap] 压缩后重新吸附打卡点 {}/{}：最近距离 {:.3}m → {:.4}m，单点最大位移 {:.2}m，相邻最大间距 {:.1}m",
@@ -1495,6 +1586,15 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 校验视图。这一步是「自检守 A、提交发 B」的根治：检查对象从内存结构
     // 换成报文 JSON 反解的结果，两者物理上是同一份数据。
     // uid/unid 用占位符——校验不看身份字段。
+    // 海拔区间只解析一次，自检与提交共用——避免两处各查一次、结果不同。
+    let alt = effective_alt_range(p);
+    match alt {
+        Some((lo, hi)) => log(&format!(
+            "√ [elev] 海拔区间 {lo:.1}~{hi:.1}m（DEM / 环境变量）"
+        )),
+        None => log("· [elev] 取不到海拔真值，退回默认 150±8m（齐齐哈尔样本，可能与本校区矛盾）"),
+    }
+
     let probe = super::submit::SubmitParams {
         uid: "probe".into(),
         unid: "0".into(),
@@ -1511,7 +1611,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         run_area_id: -1,
         geo_fences_json: "[]".into(),
         total_ascent: 0,
-        alt_range: p.alt_range,
+        alt_range: alt,
     };
     // 必到点：这里只挑「是哪个点」（两套坐标 + 名字），**不发号**。
     //
@@ -1922,7 +2022,7 @@ pub fn run_full(
             .unwrap_or(-1),
         geo_fences_json: geo_fences,
         total_ascent: 0,
-        alt_range: p.alt_range,
+        alt_range: effective_alt_range(p),
     };
 
     // 报文的桶必须来自 sim，不能在这里重新生成——否则自检、提交、明细
@@ -2294,7 +2394,9 @@ mod body_pace_tests {
         let note = body_pace_note(2000.0, 720, Some((5.0, 10.0))).unwrap();
         assert!(note.starts_with("! [pace]"), "{note}");
         assert!(note.contains("距区间边界只有"), "{note}");
-        assert!(note.contains("5'04"), "应报出主体配速，实际 {note}");
+        // 起步窗口在 720 秒的记录上封顶 86 秒（改前按 15.5% 外推是 112 秒），
+        // 主体配速因此从 5'04" 抬到 5'17"，仍贴着下界 17 秒 → 依旧是要警告的形态。
+        assert!(note.contains("5'17"), "应报出主体配速，实际 {note}");
     }
 
     /// 太慢：主体超过上界。

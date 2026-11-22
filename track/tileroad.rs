@@ -797,6 +797,16 @@ pub fn route_through(
     must: &[(f64, f64)],
     want_m: f64,
 ) -> Result<Vec<(f64, f64)>, String> {
+    let mut fixed = || 0u64;
+    route_through_seeded_inner(g, must, want_m, &mut fixed)
+}
+
+fn route_through_seeded_inner(
+    g: &RoadGraph,
+    must: &[(f64, f64)],
+    want_m: f64,
+    next: &mut impl FnMut() -> u64,
+) -> Result<Vec<(f64, f64)>, String> {
     if must.len() < 2 {
         return Err("至少要两个点".into());
     }
@@ -813,7 +823,7 @@ pub fn route_through(
             g.nodes
                 .iter()
                 .enumerate()
-                .filter(|(_, n)| crate::track::geo::distance(**n, *p) < 25.0)
+                .filter(|(_, n)| crate::track::geo::distance(**n, *p) < 40.0)
                 .map(|(i, _)| i)
                 .collect()
         })
@@ -900,6 +910,40 @@ pub fn route_through(
             }
         }
         let Some((_, m)) = pick else { break };
+        // 在「够远」的候选里随机挑一个，而不是永远选最接近剩余里程的那个。
+        // 候选必须**接近剩余里程**（±40%），只在够近的那一档里随机——
+        // 早先把「够远」的候选按距离降序取，结果挑到全图最远的节点，2.4km
+        // 的目标跑出 3.6km（实测）。
+        let mut band: Vec<usize> = de
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| {
+                d.is_finite()
+                    && **d >= need * 0.85
+                    && **d <= need * 1.15
+                    && !all_zones.contains(i)
+                    && *i != last
+            })
+            .map(|(i, _)| i)
+            .collect();
+        band.sort_unstable();
+        // 延伸段默认**不加随机**：走「最接近剩余里程」的那个节点，路线形状
+        // 才稳定，打卡点次序也不会被延伸段扫到（实测强随机会让 #4 抢到 #2 前面）。
+        // 「同一条路、每天差十几米」这件事交给下游的横向摆动（`soften`）。
+        // 想要「每天换一条街」的强随机，再开 `PACE_ROUTE_RANDOM=1`。
+        let strong = std::env::var("PACE_ROUTE_RANDOM").ok().as_deref() == Some("1");
+        let mut near: Vec<(f64, usize)> = band
+            .iter()
+            .map(|i| ((de[*i] - need).abs(), *i))
+            .collect();
+        near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let m = if near.is_empty() {
+            m
+        } else if strong {
+            near[(next() as usize) % near.len().min(3)].1
+        } else {
+            near.remove(0).1
+        };
         let Some(tail) = astar_penalized(g, last, m, &used, 4.0, &HashSet::new()) else {
             break;
         };
@@ -928,7 +972,162 @@ pub fn route_through(
         path.extend(back.into_iter().skip(1));
     }
 
-    Ok(path.into_iter().map(|i| g.nodes[i]).collect())
+    let coords: Vec<(f64, f64)> = path.into_iter().map(|i| g.nodes[i]).collect();
+    Ok(insert_spurs(coords, must))
+}
+
+/// 带随机扰动的路线规划。
+///
+/// 为什么必须随机：同一账号连续两天的记录，如果走的是同一条折线，服务端把
+/// 两条轨迹各重采样后一比就是**同一条线**（实测重合度 100%）。真人即使天天
+/// 跑同一条路，也会被行人、车辆、进出校门的位置挤开 8~20 米。
+///
+/// 扰动手法（都不改变打卡点次序）：
+/// 1. 起点附近先绕一小圈（像从宿舍走到场地，真实跑者的起步区本来就不在
+///    第一个打卡点上）；
+/// 2. 中段插 2~3 段「绕过去再回来」的小折返（绕楼、绕人群）；
+/// 3. 补里程的延伸段从「离目标最近」改成「在够远的节点里随机挑」。
+pub fn route_through_seeded(
+    g: &RoadGraph,
+    must: &[(f64, f64)],
+    want_m: f64,
+    seed: u64,
+) -> Result<Vec<(f64, f64)>, String> {
+    let mut rng_seed = seed | 1;
+    let mut next = || {
+        // xorshift64*：够用、无依赖、可复现
+        rng_seed ^= rng_seed >> 12;
+        rng_seed ^= rng_seed << 25;
+        rng_seed ^= rng_seed >> 27;
+        rng_seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+
+    let base = route_through_seeded_inner(g, must, want_m, &mut next)?;
+    Ok(inject_detours(g, base, must, &mut next))
+}
+
+/// 在轨迹上插若干「小折返」，让每次跑出来的线不一样。
+///
+/// 只动坐标、不动时间轴（采样与压缩都在下游做），所以不会破坏 5 秒节奏。
+/// 每段折返控制在 30~90 米，来回走完再回到原路——真实跑者绕开人群、绕开
+/// 施工围挡就是这个形态。
+fn inject_detours(
+    g: &RoadGraph,
+    path: Vec<(f64, f64)>,
+    must: &[(f64, f64)],
+    next: &mut impl FnMut() -> u64,
+) -> Vec<(f64, f64)> {
+    if path.len() < 40 || g.nodes.is_empty() {
+        return path;
+    }
+    let mut out = path;
+    // 默认 **0 段**：折返会改动打卡点附近的几何，实测它能稳定触发
+    // `CP_MISS`（1~7 米），而"路线不同"这件事光靠延伸段随机已经做到了
+    // （两条 dry 的轨迹重合度掉到 0%）。要更夸张的差异再开
+    // `PACE_DETOURS=2`，并接受踩点的风险。
+    let n_detours = std::env::var("PACE_DETOURS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    for _ in 0..n_detours {
+        let lo = out.len() / 8;
+        let hi = out.len() * 7 / 8;
+        if hi <= lo {
+            break;
+        }
+        let idx = lo + (next() as usize) % (hi - lo);
+        let pivot = out[idx];
+        // 离打卡点太近就不能动：折返会把「经过点位」的那段几何推开，
+        // 后面靠吸附补不回来（实测一次插 2 段就有 3 个点位变成 CP_MISS）。
+        if must
+            .iter()
+            .any(|c| crate::track::geo::distance(pivot, *c) < 60.0)
+        {
+            continue;
+        }
+        // 在 30~90m 里找一个路网节点当「绕行顶点」
+        let want = 30.0 + (next() % 31) as f64;
+        let mut best = (usize::MAX, f64::INFINITY);
+        for (i, node) in g.nodes.iter().enumerate() {
+            let d = crate::track::geo::distance(*node, pivot);
+            if (d - want).abs() < best.1 {
+                best = (i, (d - want).abs());
+            }
+        }
+        if best.0 == usize::MAX {
+            continue;
+        }
+        let detour = g.nodes[best.0];
+        let back = pivot;
+        // 4 米密铺，避免出现几十米的直线跳变
+        let mut block = Vec::new();
+        for (a, b) in [(pivot, detour), (detour, back)] {
+            let d = crate::track::geo::distance(a, b);
+            let k = ((d / 4.0).ceil() as usize).clamp(2, 30);
+            for j in 1..=k {
+                let t = j as f64 / k as f64;
+                block.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+            }
+        }
+        out.splice(idx + 1..idx + 1, block);
+    }
+    out
+}
+
+/// 给每个打卡点插一段「支线」：从最近的路网节点走到点位坐标，再走回来。
+///
+/// 为什么必须有：`route_through` 只把打卡点**连到最近的路径节点**上，实测
+/// 有打卡点离可走道路 20~65 米（「音乐厅3」这种在院落/楼里的点）。不插支线，
+/// 轨迹最近只能擦到 6~73 米，全靠事后 `snap_checkpoints` 硬拽——拽不动就
+/// `CP_MISS`（0.5 米，Fatal 级），拽动了又会把相邻间距扯成 40 米以上。
+///
+/// 支线**按 4 米密铺**：采样是 5 秒一次（10~15 米一点），只放「节点→点位」
+/// 两个端点的话，中间会出现一条几十米的直线跳变，`GEO_JUMP` 当场拦下。
+///
+/// 插点顺序按「单调向后找最近节点」定，只插入不删除，所以点的次序仍然是
+/// 服务端给的次序（`point-order` 的硬约束）。
+fn insert_spurs(path: Vec<(f64, f64)>, must: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if path.len() < 2 || must.is_empty() {
+        return path;
+    }
+    let mut anchors: Vec<(usize, usize)> = Vec::new(); // (must 下标, path 下标)
+    let mut from = 0usize;
+    for (mi, &cp) in must.iter().enumerate() {
+        let mut best = (usize::MAX, f64::INFINITY);
+        for (i, &p) in path.iter().enumerate().skip(from) {
+            let d = crate::track::geo::distance(p, cp);
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        if best.0 == usize::MAX {
+            continue;
+        }
+        from = best.0;
+        anchors.push((mi, best.0));
+    }
+    let mut out = path;
+    for &(mi, idx) in anchors.iter().rev() {
+        let cp = must.get(mi).copied().unwrap_or(out[idx]);
+        let base = out[idx];
+        let d = crate::track::geo::distance(base, cp);
+        if d < 0.3 {
+            out[idx] = cp;
+            continue;
+        }
+        let n = ((d / 4.0).ceil() as usize).clamp(2, 40);
+        let mut spur: Vec<(f64, f64)> = Vec::with_capacity(n);
+        for k in 1..=n {
+            let t = k as f64 / n as f64;
+            spur.push((base.0 + (cp.0 - base.0) * t, base.1 + (cp.1 - base.1) * t));
+        }
+        // 回程原路返回：服务端只要求「经过」，进院门再出来是真实跑者的常见动作。
+        let back: Vec<(f64, f64)> = spur.iter().rev().copied().collect();
+        let mut block = spur;
+        block.extend(back.into_iter().skip(1));
+        out.splice(idx + 1..idx + 1, block);
+    }
+    out
 }
 
 /// 从 s 出发到全图各点的最短距离（不可达为 INF）。闭环选绕行顶点用。

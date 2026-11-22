@@ -445,6 +445,8 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
         (Method::Get, "/api/points") => handle_points(request, state, &query),
         (Method::Get, "/api/records") => handle_records(request, state, &query),
         (Method::Get, "/api/cheat") => handle_cheat(request, state, &query),
+        // 风控体检 + 今日建议：面板上那块「体检/建议」卡用的就是这个。
+        (Method::Get, "/api/check") => handle_check(request, state),
         (Method::Get, "/api/blockers") => handle_blockers_get(request),
         (Method::Post, "/api/blockers") => {
             // body 坏掉是客户端问题，必须回 400 + 具体原因；早先经 `?` 上抛
@@ -2090,6 +2092,61 @@ fn handle_raw(
 /// 服务端跑批判定，和提交是否成功无关——提交成功也可能事后被标记。
 /// 这个接口是唯一能自己确认的入口，所以结果要原样返回给前端，
 /// 由前端区分「没有记录」和「结果未知」两种状态。
+/// 风控体检 + 今日建议（只读）。
+///
+/// 返回两块：`audit`（账号级排班式特征打分）和 `suggest`（今天能不能刷、
+/// 刷多少、什么时段）。两者都从最近 40 条记录算，不碰任何写接口。
+fn handle_check(request: tiny_http::Request, state: Shared) -> Result<(), String> {
+    let client = {
+        let st = lock_state(&state);
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
+    };
+    let list = match crate::api::records::list_records(&client, 1, 40, 0) {
+        Ok(v) => v,
+        Err(e) => return json_err(request, &format!("拉取记录失败: {e}")),
+    };
+    let runs = crate::api::risk::parse_runs(&list);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let rep = crate::api::risk::assess(&runs, now);
+    let sug = crate::api::risk::suggest(&runs, now, (now / 1000) as u64);
+
+    json_ok(
+        request,
+        json!({
+            "audit": {
+                "score": rep.score,
+                "grade": rep.grade(),
+                "streak": rep.streak_days,
+                "week": rep.days_last_7,
+                "hour": rep.top_hour,
+                "hour_share": rep.hour_concentration,
+                "dist_cv": rep.dist_cv,
+                "pace_cv": rep.pace_cv,
+                "same_day": rep.same_day_days,
+                "mean_km": rep.mean_km,
+                "flags": rep.flags.iter().map(|(p, m)| json!({"points": p, "msg": m})).collect::<Vec<_>>(),
+            },
+            "suggest": {
+                "allowed": sug.allowed,
+                "reason": sug.reason,
+                "km": sug.km,
+                "minutes": sug.minutes,
+                "hour": sug.hour,
+            },
+            "records": runs.len(),
+        }),
+    )
+}
+
 fn handle_cheat(request: tiny_http::Request, state: Shared, query: &str) -> Result<(), String> {
     let page = query_param(query, "page")
         .and_then(|v| v.parse().ok())

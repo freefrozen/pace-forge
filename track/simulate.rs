@@ -123,13 +123,11 @@ pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, 
         }
         let fat = fatigue_from_km(elapsed_km);
         // 目标步频走 biomech::gait：标定区间（≥2.0 m/s）是同一条回归
-        // `34.4 + 44.5v` 带疲劳衰减，行为不变。慢速跑（巡航 <2.0 m/s）
-        // 有两个差异：一是回归不许外推（12:00/km 外推出 96 步/分、被下限
-        // 夹平，实测真机 179，issue #7）；二是步频不跟着**瞬时**速度扫——
-        // 真机慢跑的步频顶在一个稳值上，速度的起伏全由步幅吸收（#7 真机
-        // 步频曲线近似水平线）。所以慢速跑的目标步频按巡航速度取一次，
-        // 之后只随疲劳度缓降；瞬时速度仍走 `speeds`，步幅在下面第 ③ 步
-        // 由等式反解，自动吸收全部起伏。
+        // `a + b·v` 带疲劳衰减，系数可由 `PACE_CAD_*` 覆盖（账号口径）。
+        // 慢速跑（巡航 <2.0 m/s）两处不同：一是回归不许外推（12:00/km 外推
+        // 出 96 步/分、被下限夹平，实测真机 179，issue #7）；二是步频不跟着
+        // **瞬时**速度扫——真机慢跑的步频顶在一个稳值上，速度起伏全由步幅
+        // 吸收。所以慢速跑的目标步频按巡航速度取一次，之后只随疲劳度缓降。
         let target_v = if v_cruise >= super::biomech::GAIT_REGRESSION_FLOOR_MPS {
             v
         } else {
@@ -147,8 +145,8 @@ pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, 
         // 近乎常数（实测标准差 0.86 步 / 2.7%），真人 10 秒步数有 5~10% 抖动。
         0.07,
         3.2,
-        100.0,
-        215.0,
+        super::biomech::cad_bounds().0,
+        super::biomech::cad_bounds().1,
     );
 
     // ③ 步幅：由等式反解，保证 v = cadence/60 * stride 成立

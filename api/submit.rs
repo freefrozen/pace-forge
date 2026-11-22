@@ -2000,23 +2000,25 @@ mod tests {
         assert_eq!(arr[0]["id"], 60000);
         assert_eq!(arr[1]["id"], 60001);
 
-        // `queueNum` 与点位同一条 floor 分区：720 秒 → 起步窗口 112 秒 →
-        // 桶网格上 `112/10 = 11` 个整桶，所以前 11 个桶是 0；
-        // 之后 `ceil((72-1-11)/24) = 3` 个桶一档。
+        // `queueNum` 与点位同一条 floor 分区：720 秒按比例外推是 112 秒，
+        // 但起步窗口封顶 86 秒（见 `track::STARTUP_SEC`）→ 桶网格上
+        // `86/10 = 8` 个整桶，所以前 8 个桶是 0；
+        // 之后 `ceil((72-1-8)/24) = 3` 个桶一档。
         let n = arr.len();
         assert_eq!(n, 72);
         let su = crate::track::buckets::bucket_startup(p.total_time_sec);
-        assert_eq!(su, 11, "720 秒的起步窗口落在 11 个整桶上");
+        assert_eq!(su, 8, "720 秒的起步窗口封顶 86 秒，落在 8 个整桶上");
         for (i, b) in arr.iter().enumerate() {
             let want = crate::track::queue_num(i, n, su);
             assert_eq!(b["queueNum"], want, "第 {i} 个速度桶 queueNum 错");
         }
         assert_eq!(arr[0]["queueNum"], 0, "起步段首个桶是 0 档");
         assert_eq!(arr[su]["queueNum"], 1, "出起步窗口的桶从 1 起");
-        // 60 个格子铺 24 档 → 步长 ceil(60/24)=3，`24×3 = 72 > 60`，所以只用满
-        // 到第 21 档（真机 555 秒那组 94/4 恰好走到 24，这里到不了是整数台阶
-        // 的必然结果，不是笔误）。上限仍是 24，绝不会出现桶序号 71。
-        assert_eq!(arr[n - 1]["queueNum"], 21, "720 秒末桶落在第 21 档");
+        // 63 个格子（72-1-8）铺 23 档 → 步长 ceil(63/23)=3，`23×3 = 69 > 63`，
+        // 所以到第 22 档就到顶（起步窗口封顶 86 秒后，格子从 60 变成 63）。
+        // 真机 555 秒那组 94/4 恰好走到 24；这里到不了是整数台阶的必然结果，
+        // 不是笔误。上限仍是 24，绝不会出现桶序号 71。
+        assert_eq!(arr[n - 1]["queueNum"], 22, "720 秒末桶落在第 22 档");
         assert!(arr.iter().all(|b| b["queueNum"].as_i64().unwrap() <= 24));
 
         // stepsPerTenSec 用同样的 id / queueNum 规则

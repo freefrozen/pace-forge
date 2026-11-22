@@ -465,6 +465,12 @@ button.danger:hover:not(:disabled) { background: var(--danger-hi); border-color:
 
   <div class="panel" id="runPanel">
     <h2>刷跑</h2>
+    <!-- 风控体检 / 今日建议：点一下从 /api/check 取，只读、不发提交 -->
+    <div style="flex-basis:100%;margin:0 0 10px">
+      <button id="ckBtn" class="ghost" type="button">体检 + 拿建议参数</button>
+      <div id="ckCard" class="hint" style="display:none;margin-top:8px;padding:10px 12px;
+           border:1px solid var(--line-soft);border-radius:10px;line-height:1.7"></div>
+    </div>
     <div class="runform">
       <label>跑法<select id="rRunMode">
         <option value="1">记分跑（校园跑）</option>
@@ -635,6 +641,49 @@ const api = async (url, opt) => {
   if (!j.ok) throw new Error(j.error || '请求失败');
   return j.data;
 };
+/* ---- 体检 + 今日建议 -------------------------------------------------
+   数据来自 /api/check（只读：拉最近 40 条记录算分，不碰提交接口）。
+   「用建议参数」会把距离/时长填进表单，时长自动那个勾会被取消——建议值
+   是刻意跟最近几条拉开差异的，不能被「自动时长」再随机覆盖掉。 */
+$('ckBtn').onclick = async () => {
+  const btn = $('ckBtn'), card = $('ckCard');
+  busy(btn, true);
+  try {
+    const d = await api('/api/check');
+    const a = d.audit || {}, g = d.suggest || {};
+    const color = a.score >= 55 ? '#d33' : (a.score >= 25 ? '#c80' : '#1a7f37');
+    let html = `<div><b>风控体检</b> 风险分 <b style="color:${color}">${Math.round(a.score)}/100</b>
+      （${a.grade}）· 连续 ${a.streak} 天 · 近 7 天 ${a.week} 天 · 日均 ${(a.mean_km||0).toFixed(2)} km</div>`;
+    if ((a.flags || []).length) {
+      html += '<div style="margin-top:6px">' + a.flags.map(f => `· −${f.points} ${f.msg}`).join('<br>') + '</div>';
+    }
+    html += `<div style="margin-top:8px"><b>今日建议</b>：${g.allowed
+      ? `${g.km} km / ${g.minutes} 分钟（建议 ${g.hour} 点前后）`
+      : `<span style="color:#d33">不建议刷</span> —— ${g.reason}`}</div>`;
+    if (g.allowed) {
+      html += `<div style="margin-top:8px"><button id="ckUse" class="primary" type="button">
+        用建议参数（${g.km} km / ${g.minutes} 分）</button></div>`;
+    }
+    card.innerHTML = html;
+    card.style.display = 'block';
+    if (g.allowed) {
+      $('ckUse').onclick = () => {
+        $('rDist').value = g.km;
+        $('rAutoDur').checked = false;
+        $('rDur').readOnly = false;
+        $('rDur').value = g.minutes;
+        card.querySelector('div:last-child').innerHTML =
+          `<span style="color:#1a7f37">已填入：${g.km} km / ${g.minutes} 分钟。点「生成」看自检，再点「真的跑」提交。</span>`;
+      };
+    }
+  } catch (e) {
+    card.textContent = '体检失败：' + (e.message || e);
+    card.style.display = 'block';
+  } finally {
+    busy(btn, false);
+  }
+};
+
 /* 按钮进入/退出「进行中」态：禁用 + 转圈，避免连点重复提交 */
 const busy = (btn, on) => { if (btn) { btn.classList.toggle('busy', on); btn.disabled = on; } };
 

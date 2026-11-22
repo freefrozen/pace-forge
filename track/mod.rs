@@ -40,12 +40,33 @@ pub use planner::{assign_times, plan, Checkpoint, PlanRequest, PlanResult, Track
 /// 报文上的地方，差 3 秒就是差一整个 20 秒窗口的边。
 pub const STARTUP_RATIO: f64 = 0.155;
 
+/// 起步窗口的**绝对**时长（秒）。
+///
+/// `STARTUP_RATIO` 是从唯一一条 555 秒记录（86 秒 / 15.50%）反推出来的比例，
+/// 但「GPS 锁星 + 抬脚起跑」是物理动作，**不随总里程倍增**。按比例外推的
+/// 后果实测过：20 分钟的记录会切出 186 秒（3.1 分钟）起步窗口，这 3 分钟里
+/// 速度接近 0，配速会被算成 30~90 分/公里。对「4'00"~12'00"」这种规则，
+/// 逐段判定时前 18 个 10 秒桶全部越界——真机那 8 个零位移桶能过，是因为
+/// 它只有 86 秒、且服务端对起步段另有处理，多出来的 100 秒没有同样待遇。
+///
+/// 真机 86 秒是唯一实测值，取它作上界；短记录用 `total_sec / 2` 兜底。
+///
+/// 这一处只改「窗口有多长」，`STARTUP_DIST_RATIO`（窗口吃掉多少里程）不动：
+/// 真机 86 秒走 18.4m = 全程 1.093%，那条关系与总时长无关。
+pub const STARTUP_SEC: i64 = 86;
+
 /// 起步窗口的秒数（`segment_json` 首段时长、速度/步频桶的 state 分界）。
+///
+/// 取 `min(比例外推, STARTUP_SEC)`：短记录沿用真机比例（67 秒 → 10 秒，
+/// 与改前逐位一致），长记录封顶在 86 秒。**不能只取固定值**——67 秒的记录
+/// 被塞进 86 秒窗口会被 `total_sec / 2` 夹到 33 秒，等于把整条记录的三分之一
+/// 都算成「原地起步」，采样弦长跟着变。
 pub fn startup_sec(total_sec: i64) -> i64 {
     if total_sec <= 20 {
         return 0;
     }
-    ((total_sec as f64 * STARTUP_RATIO).round() as i64).clamp(5, total_sec / 2)
+    let ratio = (total_sec as f64 * STARTUP_RATIO).round() as i64;
+    ratio.min(STARTUP_SEC).clamp(5, total_sec / 2)
 }
 
 /// 起步窗口吃掉的里程占全程的比例。
@@ -954,6 +975,27 @@ pub fn cadence_stats(pts: &[TrackPoint]) -> CadenceStats {
 ///
 /// 返回对齐了几个点位。
 pub fn align_samples_to_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) -> usize {
+    align_samples_impl(pts, cps, false)
+}
+
+/// 强制「按服务端给的次序」经过打卡点的版本（生产路径用它）。
+///
+/// 服务端判定是「按顺序通过所有点位」，而 `align` 只挑最近的那个采样点：
+/// 两个点位在轨迹上挨得近时，各自会挑到对方的位置，输出 0/45/85/59/81 这种
+/// 次序。加了单调游标后，第 i 个点位只允许落在第 i-1 个之后——真做不到就
+/// 留空，交给 `preflight` 如实报 `CP_MISS`，而不是悄悄发出一条乱序报文。
+pub fn align_samples_to_checkpoints_ordered(
+    pts: &mut [TrackPoint],
+    cps: &[(f64, f64)],
+) -> usize {
+    align_samples_impl(pts, cps, true)
+}
+
+fn align_samples_impl(
+    pts: &mut [TrackPoint],
+    cps: &[(f64, f64)],
+    ordered: bool,
+) -> usize {
     let n = pts.len();
     if n < 3 || cps.is_empty() {
         return 0;
@@ -971,6 +1013,7 @@ pub fn align_samples_to_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) 
     }
     let mut done = 0usize;
     let mut taken: Vec<usize> = Vec::with_capacity(cps.len());
+    let mut cursor = 0usize;
     for &cp in cps {
         let (arc_cp, dist_cp) = nearest_arc_on(&xy, &arc, cp);
         // 轨迹压根没经过它：不动，让 preflight 如实报 CP_MISS
@@ -980,7 +1023,7 @@ pub fn align_samples_to_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) 
         let mut idx = usize::MAX;
         let mut best = f64::INFINITY;
         for (i, &a) in arc.iter().enumerate() {
-            if taken.contains(&i) || i == 0 || i + 1 >= n {
+            if taken.contains(&i) || (ordered && i + 2 < cursor) || i == 0 || i + 1 >= n {
                 continue;
             }
             let d = (a - arc_cp).abs();
@@ -1006,6 +1049,9 @@ pub fn align_samples_to_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) 
         pts[idx].lat = target.0;
         pts[idx].lon = target.1;
         taken.push(idx);
+        if ordered {
+            cursor = idx;
+        }
         done += 1;
     }
     done
@@ -1098,32 +1144,62 @@ impl SnapReport {
 /// 调用顺序有硬要求：必须在 `real_len` 重算**之前**，否则上报的 `totalDis`
 /// 与最终几何不同源（`DIST_MISMATCH` 会当场拦下）。
 pub fn snap_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) -> SnapReport {
+    snap_impl(pts, cps, false)
+}
+
+/// `snap_checkpoints` 的顺序版：吸附也不许往回走（生产路径用它）。
+pub fn snap_checkpoints_ordered(pts: &mut [TrackPoint], cps: &[(f64, f64)]) -> SnapReport {
+    snap_impl(pts, cps, true)
+}
+
+fn snap_impl(pts: &mut [TrackPoint], cps: &[(f64, f64)], ordered: bool) -> SnapReport {
     let mut rep = SnapReport::default();
     if pts.len() < 3 || cps.is_empty() {
         return rep;
     }
     let mut xy: Vec<(f64, f64)> = pts.iter().map(|p| (p.lat, p.lon)).collect();
     let mut used: Vec<usize> = Vec::with_capacity(cps.len());
-
+    let mut cursor = 0usize;
     for (ci, &cp) in cps.iter().enumerate() {
         // 跳过已经被别的打卡点占用的下标：两个点位抢同一个采样点时，先到
         // 的那个保住精确命中，后到的贴上去只会把前一个又顶走。
         let mut idx = usize::MAX;
         let mut before = f64::INFINITY;
-        for (i, p) in xy.iter().enumerate() {
-            if used.contains(&i) {
-                continue;
+        // 顺序模式下先找「游标之后第一个已经够近的点」：路线可能在后段
+        // （补里程的延伸段）又从点位旁边擦过，全局最近会把落点选到那里，
+        // 随后更靠后的点位就再也找不到合法位置（实测 CP_MISS 1~7 米）。
+        if ordered {
+            for (i, p) in xy.iter().enumerate().skip(cursor + 1) {
+                if used.contains(&i) {
+                    continue;
+                }
+                let d = geo::distance(*p, cp);
+                if d <= CHECKPOINT_SNAP_MAX_M {
+                    idx = i;
+                    before = d;
+                    break;
+                }
             }
-            let d = geo::distance(*p, cp);
-            if d < before {
-                before = d;
-                idx = i;
+        }
+        if idx == usize::MAX {
+            for (i, p) in xy.iter().enumerate() {
+                if used.contains(&i) || (ordered && i + 2 < cursor) {
+                    continue;
+                }
+                let d = geo::distance(*p, cp);
+                if d < before {
+                    before = d;
+                    idx = i;
+                }
             }
         }
         if idx == usize::MAX {
             continue;
         }
         used.push(idx);
+        if ordered {
+            cursor = idx;
+        }
         let mut shifted = false;
         if before > 1e-6 {
             if before <= CHECKPOINT_SNAP_MAX_M {
@@ -1144,10 +1220,6 @@ pub fn snap_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) -> SnapRepor
         });
     }
 
-    if rep.items.iter().all(|s| !s.shifted) {
-        return rep;
-    }
-
     for (i, (la, lo)) in xy.iter().enumerate() {
         pts[i].lat = *la;
         pts[i].lon = *lo;
@@ -1163,6 +1235,41 @@ pub fn snap_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) -> SnapRepor
             p.lon = cps[s.cp].1;
         }
     }
+    // 收尾补吸：被「顺序游标」或「占用」规则筛掉的打卡点，只要残距已经
+    // ≤ 8 米，就直接把最近的那个采样点钉到点位坐标上。
+    //
+    // 为什么要这一遍：主循环里 `ordered` 会拦掉「落点比上一个点位还靠前」的
+    // 候选，实测有 3.3m 残距被整条记录判 `CP_MISS`（0.5m，Fatal）。3 米这个量级
+    // 不是「轨迹没经过」，而是采样网格把点跨过去了——补钉一次就干净。
+    let mut cursor = rep.items.iter().map(|s| s.index).max().unwrap_or(0);
+    for (ci, &cp) in cps.iter().enumerate() {
+        let already = rep
+            .items
+            .iter()
+            .any(|s| s.cp == ci && (s.after_m <= CHECKPOINT_HIT_M || s.before_m <= CHECKPOINT_HIT_M));
+        if already {
+            continue;
+        }
+        let (mut bi, mut bd) = (usize::MAX, f64::INFINITY);
+        for (i, p) in pts.iter().enumerate() {
+            // 补吸也必须守住「按点位次序经过」：只往后找，捞到前一个点位
+            // 之前的点会立刻把顺序打乱（实测 #3 抢到 #1 前面）。
+            if i <= cursor || i == 0 || i + 1 >= pts.len() {
+                continue;
+            }
+            let d = geo::distance((p.lat, p.lon), cp);
+            if d < bd {
+                bd = d;
+                bi = i;
+            }
+        }
+        if bi != usize::MAX && bd <= 8.0 {
+            pts[bi].lat = cp.0;
+            pts[bi].lon = cp.1;
+            cursor = bi;
+        }
+    }
+
     // 用**最终**几何重新量：after_m 必须是 preflight 会看到的那个数，
     // 不是「刚设完就宣布成功」的那个。
     for s in rep.items.iter_mut() {
