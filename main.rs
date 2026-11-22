@@ -104,6 +104,10 @@ fn main() {
             }
         }
         "advise" => do_advise(),
+        "review" => {
+            let n: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10);
+            do_review(n);
+        }
         "history" => {
             let n: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
             do_history(n);
@@ -209,6 +213,7 @@ fn main() {
             println!("  pace-forge history [N]        拉最近 N 条记录明细并落盘（只读）");
             println!("  pace-forge audit              账号风控体检（连续天数/时刻/里程离散度）");
             println!("  pace-forge suggest            今天该不该刷、刷多少（只读）");
+            println!("  pace-forge review [N]        逐条查审核状态（可疑/驳回/申诉），默认 10 条");
             println!("  pace-forge tracks [N]         轨迹重合度体检（拉 OBS 明细比对，默认 5 条）");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
             println!("  pace-forge config              列出全部 PACE_* 开关与当前取值");
@@ -295,6 +300,76 @@ fn dry_run(dist_km: f64, dur_min: f64) {
             eprintln!("\n预演失败: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// 逐条查审核状态：列表接口不返回 status，只能一条条拉详情。
+///
+/// 2026-11-22 那条被驳回的记录教会我们两件事：① 驳回可能是**提交后隔几天**
+/// 才发生的（那条 11-18 提交、11-22 00:03 才审）；② 列表里看不出状态，
+/// 必须拉详情。所以给一条能一次扫完的命令，别靠翻 App。
+fn do_review(n: u32) {
+    use pace_forge::api::{client, records, session};
+
+    let sess = session::load_session();
+    if !sess.is_valid() {
+        eprintln!("未登录：先在 http://127.0.0.1:9999 登录一次");
+        std::process::exit(1);
+    }
+    let c = client::Client::new(client::DeviceProfile::default()).with_credentials(
+        client::Credentials {
+            uid: Some(sess.uid.to_string()),
+            token: Some(sess.token.clone()),
+            unid: Some(sess.unid.clone()),
+        },
+    );
+    let list = match records::list_records(&c, 1, n, 0) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("拉取记录失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let rows = list
+        .get("records")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    println!("审核状态（最近 {} 条，只读）\n", rows.len());
+    println!("{:>14} {:>7} {:>8} {:>6}  {}", "rrid", "状态", "里程(m)", "申诉", "备注");
+    let mut bad = 0;
+    for r in &rows {
+        let rrid = r.get("rrid").and_then(|v| v.as_i64()).unwrap_or(0);
+        let dis = r.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let d = match records::get_record(&c, rrid) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let status = d.get("status").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let cheat = d.get("isCheat").and_then(|v| v.as_i64()).unwrap_or(0);
+        let appeal = d.get("appealStatus").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let info = d
+            .get("statusInfo")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(26)
+            .collect::<String>();
+        let flag = match (status, cheat) {
+            (0, 0) => "正常",
+            (1, _) | (_, 1) => {
+                bad += 1;
+                "可疑"
+            }
+            _ => "?",
+        };
+        println!("{rrid:>14} {flag:>7} {dis:>8.0} {appeal:>6}  {info}");
+    }
+    println!();
+    if bad == 0 {
+        println!("没有发现被标记的记录。");
+    } else {
+        println!("⚠ {bad} 条被标记：审核是跑批的，提交成功不等于安全，隔几天再看一次。");
     }
 }
 
