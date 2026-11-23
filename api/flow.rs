@@ -1834,6 +1834,15 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         .collect();
 
     let probe_sub = super::submit::build(&probe, &track_points, &fixed, &sim)?;
+    // `PACE_DUMP_PAYLOAD=/tmp/p.json` 时把**将要发出去的报文**落盘，
+    // 用来核对字段（appVersion / customDeviceId / fivePointJson 键序等）。
+    // 只在预演路径生效，真提交路径不写文件。
+    if let Some(path) = std::env::var_os("PACE_DUMP_PAYLOAD") {
+        if let Ok(s) = serde_json::to_string_pretty(&probe_sub.save_record) {
+            let _ = std::fs::write(path, s);
+            log("√ [dump] 报文已落盘（PACE_DUMP_PAYLOAD）");
+        }
+    }
     let view = super::submit::verify_view(&probe_sub.save_record, &probe_sub.points)?;
     log(&format!(
         "√ [verify] 从报文反解：{} 点 / {:.0}m / {}s / {} 步 / {} 个步数桶",

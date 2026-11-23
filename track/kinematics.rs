@@ -221,6 +221,20 @@ pub fn pace_profile(
         sigma *= (v0 / 2.0).powi(3).max(0.0);
     }
 
+    // `PACE_SPEED_SIGMA_SCALE`：整体缩放速度波动（默认 1.0 = 真机标定值）。
+    //
+    // 为什么需要它：真机那条标定样本是 3.03 m/s 跑完的，σ 0.353 在那个速度下
+    // 相对离散度 31%；「21 分钟 + 3km 上限」的学校最快只能到 7'00"/km
+    // （2.38 m/s），同样的绝对 σ 会让相当比例的 10 秒桶掉到 12' 以下，
+    // 上游 `BUCKET_PACE_OUT` 实测 23~33%（真机基线 16%）。缩到 0.6~0.8
+    // 能把这个比例拉回真机量级，代价是配速图稍微平一点。
+    let scale = std::env::var("PACE_SPEED_SIGMA_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 2.0)
+        .unwrap_or(1.0);
+    sigma *= scale;
+
     // ① OU 均值回归 + 热身 ramp
     let mut w = Vec::with_capacity(n);
     let mut v = v0;
