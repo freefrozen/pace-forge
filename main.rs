@@ -88,8 +88,8 @@ fn main() {
         }
         "semester" => show_semester(),
         "elev" => {
-            let lat: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(34.04851);
-            let lon: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(113.87699);
+            let lat: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30.50000);
+            let lon: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(104.00000);
             if let Some(set) = args.get(3).and_then(|s| s.parse::<f64>().ok()) {
                 let ok = pace_forge::api::elev::remember(lat, lon, set);
                 println!("{}", if ok { "已写入高程缓存" } else { "数值不合法" });
@@ -1344,7 +1344,7 @@ fn run_with_start(
         // 但这个默认会让**成绩根本不计入校园跑**：2026-11-18 实测，用默认值
         // 提交的那条落到户外跑里，App 的「成绩/次数」看不到它（学期有效里程
         // 只涨了 0.87km，总里程涨 2.41km）。是否有时段限制应该由 policy 的
-        // `validTime` 决定（许昌学院实测 validTime=0，全天可跑），而不是靠
+        // `validTime` 决定（某校区实测 validTime=0，全天可跑），而不是靠
         // 默认成「不计分」的模式来回避。
         //
         // 覆盖方式：`--mode 2`（户外跑）或 `PACE_RUN_MODE=2`。

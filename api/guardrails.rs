@@ -48,7 +48,7 @@ pub fn inspect(
 
     // ---- ① 海拔与坐标的一致性 ----
     //
-    // 2026-11-18 那条就是死在这里：坐标在许昌（实测高程 69m），报文写
+    // 2026-11-18 那条就是死在这里：坐标在某校区（实测高程 69m），报文写
     // 150±8m（齐齐哈尔样本），差 80 米。服务端拿坐标反查高程就能判定，
     // 不需要任何模型。
     let base_used = alt_range.map(|(lo, hi)| (lo + hi) / 2.0);
@@ -122,10 +122,16 @@ pub fn inspect(
 mod tests {
     use super::*;
 
+    fn seed_dem() {
+        // 测试不依赖网络，也不依赖真实地形：先把锚点高程写进缓存
+        crate::api::elev::remember(30.50000, 104.00000, 69.0);
+    }
+
     fn params(run_mode: i64, dur_sec: i64) -> RunParams {
+        seed_dem();
         RunParams {
-            center_lat: 34.04851,
-            center_lng: 113.87699,
+            center_lat: 30.50000,
+            center_lng: 104.00000,
             distance_m: 2400.0,
             duration_sec: dur_sec,
             run_mode,
@@ -136,10 +142,10 @@ mod tests {
     fn cps(n: usize) -> Vec<Checkpoint> {
         (0..n)
             .map(|i| Checkpoint {
-                lat: 34.05 + i as f64 * 1e-4,
-                lng: 113.87,
-                glat: 34.05 + i as f64 * 1e-4,
-                glon: 113.87,
+                lat: 30.50 + i as f64 * 1e-4,
+                lng: 104.00,
+                glat: 30.50 + i as f64 * 1e-4,
+                glon: 104.00,
                 name: format!("P{i}"),
             })
             .collect()
@@ -147,7 +153,8 @@ mod tests {
 
     #[test]
     fn blocks_altitude_far_from_dem() {
-        // 150±8m 是齐齐哈尔的默认值，许昌实测 69m
+        seed_dem();
+        // 150±8m 是齐齐哈尔的默认值，某校区实测 69m
         let mut log_lines = Vec::new();
         let r = inspect(&params(1, 1320), Some((142.0, 158.0)), &cps(5), &mut |s| {
             log_lines.push(s.to_string())
@@ -157,21 +164,19 @@ mod tests {
 
     #[test]
     fn blocks_points_with_outdoor_mode() {
+        seed_dem();
         let r = inspect(&params(2, 1320), None, &cps(5), &mut |_| {});
         assert!(r.is_err(), "runMode=2 带点位应该被拦截");
     }
 
     #[test]
-    fn blocks_unbounded_startup_on_long_runs() {
-        // 不设 PACE_STARTUP_CAP_SEC 时，720 秒的记录起步窗口按比例外推是 112 秒、
-        // 22 分钟是 205 秒——都超过真机上限，应该拦住并要求封顶。
+    fn startup_window_blocked_unless_capped() {
+        // 环境变量是进程级的，这两条必须写在同一个测试里，否则并行跑会互相抢
+        seed_dem();
         unsafe { std::env::remove_var("PACE_STARTUP_CAP_SEC") };
         let r = inspect(&params(1, 1320), None, &cps(5), &mut |_| {});
-        assert!(r.is_err(), "起步窗口 205 秒应被拦截");
-    }
+        assert!(r.is_err(), "不封顶时 22 分钟记录的起步窗口是 205 秒，应被拦截");
 
-    #[test]
-    fn allows_when_startup_capped() {
         unsafe { std::env::set_var("PACE_STARTUP_CAP_SEC", "86") };
         let r = inspect(&params(1, 1320), None, &cps(5), &mut |_| {});
         assert!(r.is_ok(), "封顶 86 秒后应放行");
