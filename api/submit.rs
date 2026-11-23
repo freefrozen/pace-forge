@@ -1817,6 +1817,9 @@ pub fn build_from_points(
         "geeToken": gee_token,
         "getPrize": false,
         "goalId": Value::Null,
+        // 真机走 Gson serializeNulls，`prizeName` 虽然没值也会出现在报文里。
+        // 缺字段和 null 对服务端的解析不是一回事（脱壳确认这条在 7.4.0/7.4.20 都有）。
+        "prizeName": Value::Null,
         "isUpload": false,
         "latitude": points[0].lat,
         "longitude": points[0].lon,
@@ -1827,11 +1830,17 @@ pub fn build_from_points(
         "recordUrl": "",
         "roomId": 0,
         "runAreaId": params.run_area_id,
-        "segmentJson": "[]",
+        // 真机 `CreditRunPIml.setSegmentJson` 算完反作弊（useMobilityTools/status）
+        // 后把 segmentJson 清成空串，实际**上传空串**，不是空数组。
+        // 依据：对 7.4.20 真 dex 的脱壳确认（JustLikeCheese fork 3616b217，
+        // 被动 /proc/mem carve，反作弊未触发）；7.4.0 同构。
+        // 我们原来发 `"[]"`——语义相同但字节不同，服务端若按字符串判会不一致。
+        "segmentJson": "",
         "selDistance": params.sel_distance_m,
         "selRunTime": params.sel_run_time_sec,
         "selectedUnid": params.unid,
-        "more": false,
+        // 真机是 true（脱壳确认，7.4.0/7.4.20 一致）。我们原来发 false。
+        "more": true,
         "originalSign": crate::crypto::sign::original_sign(&sign_fields),
         "signature": signature,
         "speed": speed_val,
@@ -3207,6 +3216,34 @@ mod audit_tests {
             .collect()
     }
 
+    /// 提交体三个字节级字段：真机脱壳确认的形态，别改回去。
+    ///
+    /// 依据：JustLikeCheese fork `3616b217`/`b974617e`（7.4.20 真 dex 脱壳，
+    /// 被动 /proc/mem carve）。`segmentJson` 是空串不是 `"[]"`、`more` 是 true、
+    /// `prizeName` 走 Gson serializeNulls 所以有键无值。
+    #[test]
+    fn submit_body_matches_unpacked_7420_shape() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let sr = &sub.save_record;
+        assert_eq!(
+            sr.get("segmentJson").and_then(|v| v.as_str()),
+            Some(""),
+            "真机 segmentJson 是空串"
+        );
+        assert_eq!(
+            sr.get("more").and_then(|v| v.as_bool()),
+            Some(true),
+            "真机 more 是 true"
+        );
+        assert!(
+            sr.get("prizeName").map(|v| v.is_null()).unwrap_or(false),
+            "prizeName 必须以 null 出现，不能缺字段"
+        );
+    }
+
     #[test]
     fn audit_passes_on_freshly_built_body() {
         let p = params();
@@ -3977,6 +4014,7 @@ mod parity_regression_tests {
             start_ms: start,
             sport_type: 1,
             sample_step_m: 5.0,
+            end: None,
         };
         let mut rng = rand::rngs::StdRng::seed_from_u64(2026);
         let planned = plan(&req, &mut rng).expect("规划");

@@ -168,7 +168,14 @@ impl DeviceProfile {
     fn base() -> Self {
         Self {
             device_id: String::new(),
-            app_version: "7.4.01".into(),
+            // 真机装的就是这个版本（7.4.20 / code 411，2026-11 从设备上取）。
+            // 发旧版本号等于自报「用老客户端」，服务端的版本校验会直接看出来。
+            // 需要对照实验时用 PACE_APP_VERSION 覆盖。
+            app_version: std::env::var("PACE_APP_VERSION")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "7.4.20".into()),
             physic_pixel: "1080x2400".into(),
             logic_pixel: "393x873".into(),
             is_root: "0".into(),
@@ -408,14 +415,16 @@ impl Client {
             // 请求里五项全空），所以「发空」是一种真实状态；但空与派生各有
             // 风险，默认保持派生——同一台设备一半头有值一半空，比全空更像
             // 拼出来的。要拿对照数据时设 PACE_DEVICE_HW_HEADERS=empty，
-            // 四个硬件头一起清空，DeviceId 不动（它是设备锁，不参与这条实验）。
+            // 五个头（含 CustomDeviceId）一起清空，DeviceId 不动（它是设备锁）。
             ("androidId".into(), hw_id(&self.device.android_id)),
             ("blMac".into(), hw_id(&self.device.bl_mac)),
             ("wifiMac".into(), hw_id(&self.device.wifi_mac)),
             ("IMEI".into(), hw_id(&self.device.imei)),
             ("appInstallTime".into(), self.device.app_install_time.to_string()),
             ("appUpdateTime".into(), self.device.app_update_time.to_string()),
-            ("CustomDeviceId".into(), self.device.custom_device_id.clone()),
+            // CustomDeviceId 也是客户端自造值，真机 HAR 里同样是空串
+            // （issue #17：59/59）。跟着硬件头开关一起清。
+            ("CustomDeviceId".into(), hw_id(&self.device.custom_device_id)),
         ];
         if let Some(uid) = &self.creds.uid {
             headers.push(("uid".into(), uid.clone()));

@@ -191,7 +191,13 @@ fn main() {
         "crosscheck" => do_crosscheck(args.get(1).map(|s| s.as_str())),
         "audit" => do_audit(false, args.get(1).map(|s| s.as_str())),
         "suggest" => do_audit(true, args.get(1).map(|s| s.as_str())),
-        "tracks" => do_tracks(args.get(1).map(|s| s.as_str())),
+        "tracks" => match pace_forge::api::audit::parse_tracks_args(&args[1..]) {
+            Ok((file, top)) => do_tracks(file.as_deref(), top),
+            Err(e) => {
+                eprintln!("{e}\n用法: pace-forge tracks <records.json> [--top N]");
+                std::process::exit(2);
+            }
+        },
         "export-records" => do_export_records(&args[1..]),
         "version" | "-V" | "--version" => {
             println!("pace-forge {}", pace_forge::VERSION);
@@ -222,7 +228,7 @@ fn main() {
             println!("  pace-forge export-records [N] [out.json]  导出最近 N 条记录（含轨迹）给 crosscheck");
             println!("  pace-forge audit <json>        账号体检：连续性/时段/离散/重合，命中只提示");
             println!("  pace-forge suggest <json>      同上，再加一段「下一条怎么跑」的动作建议");
-            println!("  pace-forge tracks <json>       两两重合矩阵，区分同向与反向");
+            println!("  pace-forge tracks <json> [--top N]  两两重合矩阵，区分同向与反向；--top 只看前 N 对");
             println!("  pace-forge version             版本号");
             println!();
             println!("规则：开始 + 用时 + 5s 余量 ≤ 现在，最多往前补 3 天。");
@@ -336,7 +342,7 @@ fn do_review(n: u32) {
         .cloned()
         .unwrap_or_default();
     println!("审核状态（最近 {} 条，只读）\n", rows.len());
-    println!("{:>14} {:>7} {:>8} {:>6}  {}", "rrid", "状态", "里程(m)", "申诉", "备注");
+    println!("{:>14} {:>7} {:>8} {:>6}  备注", "rrid", "状态", "里程(m)", "申诉");
     let mut bad = 0;
     for r in &rows {
         let rrid = r.get("rrid").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -830,7 +836,8 @@ fn do_audit(with_suggestions: bool, file: Option<&str>) {
 }
 
 /// `tracks`：两两重合矩阵。同向同线是复制特征，反向是真人行为，分开列。
-fn do_tracks(file: Option<&str>) {
+fn do_tracks(file: Option<&str>, top: Option<usize>) {
+    // `--top` 只在打印层生效：判定、阈值、findings 一个字节都不动。
     use pace_forge::api::audit;
     use pace_forge::api::crosscheck as cc;
 
@@ -849,9 +856,30 @@ fn do_tracks(file: Option<&str>) {
         println!("带轨迹的记录不足两条，没有可比的对。");
         return;
     }
+    // 100 条记录就是 4950 对，全打出来没法看；`--top N` 只留两种：
+    // ① 同向且达到告警阈值的（真复制）；② 反向的（真人行为，但值得知道）。
+    let shown: Vec<&(usize, usize, f64, bool)> = match top {
+        Some(n) => {
+            let mut v: Vec<&(usize, usize, f64, bool)> = pairs
+                .iter()
+                .filter(|(_, _, ov, rev)| *rev || *ov >= audit::OVERLAP_WARN)
+                .collect();
+            v.truncate(n);
+            v
+        }
+        None => pairs.iter().collect(),
+    };
     println!();
+    if top.is_some() && shown.len() < pairs.len() {
+        println!(
+            "  只列 {} 对（共 {} 对；同向未达 {:.0}% 的、以及超出 --top 的都省略）",
+            shown.len(),
+            pairs.len(),
+            audit::OVERLAP_WARN * 100.0
+        );
+    }
     println!("  #a  #b    重合度  方向");
-    for (i, j, ov, rev) in &pairs {
+    for (i, j, ov, rev) in &shown {
         let flag = if *rev { "反向（正常）" } else { "同向" };
         println!("  {:>2}  {:>2}   {:>6.1}%  {flag}", i + 1, j + 1, ov * 100.0);
     }

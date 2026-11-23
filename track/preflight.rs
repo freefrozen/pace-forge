@@ -124,6 +124,15 @@ pub struct Check<'a> {
     pub expected_interval_sec: Option<f64>,
 }
 
+/// 逐点配速越界比例的告警阈值。
+///
+/// 真机基线约 6%（GPS 抖动导致个别点瞬时配速离谱），所以阈值必须高于它，
+/// 否则每一单都会命中，警告就没人看了。15% 意味着「大面积越界」才算问题。
+pub const PACE_BODY_OUT_WARN: f64 = 0.15;
+
+/// 10 秒桶的越界告警阈值。桶是平均值，抖动被抹平，所以阈值比点级稍低。
+pub const BUCKET_OUT_WARN: f64 = 0.10;
+
 /// 执行全部检查。
 ///
 /// 不知道「服务器现在」时，`TIME_FUTURE` 这一项跳过——本机时钟自己跟自己比
@@ -388,6 +397,77 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             ));
         }
     }
+    // 服务端可能不按「平均配速」判，而是按**逐点**或 **10 秒桶**判。7.4.20 客户端
+    // 新增了 `isPaceOutOfRange` 与「*学校要求配速范围在」文案（见逆向报告），
+    // 说明区间校验是逐点口径。这里对冲：只要主体段越界比例过高就提示，
+    // 不拦提交（真机自己也有 ~6% 的点因为 GPS 抖动越界）。
+    if let Some((lo, hi)) = c.pace_range {
+        let (fast, slow) = (lo.min(hi), lo.max(hi));
+        // 逐点：只算「在跑」的点（v ≥ 1 m/s），停下/漂移点必然越界，不能算
+        let mut body = 0usize;
+        let mut out_of_range = 0usize;
+        for w in c.points.windows(2) {
+            let dt = (w[1].time_ms - w[0].time_ms) as f64 / 1000.0;
+            if dt <= 0.0 {
+                continue;
+            }
+            let v = crate::track::geo::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)) / dt;
+            if v < 1.0 {
+                continue;
+            }
+            body += 1;
+            let point_pace = 1000.0 / v / 60.0;
+            if point_pace < fast || point_pace > slow {
+                out_of_range += 1;
+            }
+        }
+        // 阈值按**真机基线**定：真机自己的记录里约 6% 的点因 GPS 抖动越界
+        // （README「进区间比例 真机 25%」那条同理）。定 5% 会让每一单都报警，
+        // 等于把警告变成噪音；取 15% —— 正常数据不响，真异常（大面积越界）才响。
+        if body >= 20 {
+            let ratio = out_of_range as f64 / body as f64;
+            if ratio > PACE_BODY_OUT_WARN {
+                issues.push(Issue::warn(
+                    "PACE_OUT_BODY",
+                    format!(
+                        "主体段 {:.1}% 的采样点配速超出 [{fast}, {slow}]（告警线 {:.0}%，真机基线约 6%）。\n    服务端若按逐点判会被当成参数异常，建议缩短时长或调整目标配速。",
+                        ratio * 100.0,
+                        PACE_BODY_OUT_WARN * 100.0
+                    ),
+                ));
+            }
+        }
+        // 桶级：10 秒桶的平均配速
+        let mut bad_buckets = 0usize;
+        let mut total_buckets = 0usize;
+        for b in &c.sim.speed_buckets {
+            let dt = (b.end_time - b.begin_time) as f64 / 1000.0;
+            if dt <= 0.0 || b.distance <= 0.0 {
+                continue;
+            }
+            total_buckets += 1;
+            let v = b.distance / dt;
+            let bucket_pace = 1000.0 / v / 60.0;
+            if bucket_pace < fast || bucket_pace > slow {
+                bad_buckets += 1;
+            }
+        }
+        if total_buckets >= 6 {
+            let ratio = bad_buckets as f64 / total_buckets as f64;
+            if ratio > BUCKET_OUT_WARN {
+                issues.push(Issue::warn(
+                    "BUCKET_PACE_OUT",
+                    format!(
+                        "{}/{total_buckets} 个 10 秒桶的平均配速超出 [{fast}, {slow}]（{:.0}%，告警线 {:.0}%）。桶级越界比点级更容易被服务端判为参数异常。",
+                        bad_buckets,
+                        ratio * 100.0,
+                        BUCKET_OUT_WARN * 100.0
+                    ),
+                ));
+            }
+        }
+    }
+
     if pace < 3.0 {
         issues.push(Issue::warn(
             "PACE_FAST",
@@ -407,6 +487,34 @@ pub fn inspect_at(c: &Check, now_ms: Option<i64>) -> Report {
             "CADENCE_OUT",
             format!("平均步频 {avg_cad:.0} 步/分 超出服务端区间 [{cad_lo}, {cad_hi}]"),
         ));
+    }
+
+    // 桶级步频：服务端若按 10 秒桶判步频区间，平均合规但个别桶越界同样会被挑。
+    if let Some((lo, hi)) = c.step_range {
+        let (cad_lo, cad_hi) = (lo.min(hi), lo.max(hi));
+        let mut bad = 0usize;
+        let mut total = 0usize;
+        for b in &c.sim.step_buckets {
+            let dt = (b.end_time - b.begin_time) as f64 / 1000.0;
+            if dt <= 0.0 {
+                continue;
+            }
+            total += 1;
+            let cad = b.steps_num as f64 * 60.0 / dt;
+            if cad < cad_lo as f64 || cad > cad_hi as f64 {
+                bad += 1;
+            }
+        }
+        if total >= 6 && (bad as f64) > BUCKET_OUT_WARN * total as f64 {
+            issues.push(Issue::warn(
+                "BUCKET_CADENCE_OUT",
+                format!(
+                    "{bad}/{total} 个 10 秒桶的步频超出 [{cad_lo}, {cad_hi}]（{:.0}%，告警线 {:.0}%）。",
+                    bad as f64 / total as f64 * 100.0,
+                    BUCKET_OUT_WARN * 100.0
+                ),
+            ));
+        }
     }
 
     // 步态自洽：用报告的步数反跑步态，看是否与速度对得上
@@ -491,6 +599,7 @@ mod tests {
             start_ms: 1_730_000_000_000,
             sport_type: 1,
             sample_step_m: 5.0,
+            end: None,
         };
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         use rand::SeedableRng;
@@ -537,6 +646,39 @@ mod tests {
         };
         let txt = inspect_at(&c, None).lines().join("\n");
         assert!(!txt.contains("CADENCE"), "步频 70 在服务端口径内，不该被拦：{txt}");
+    }
+
+    /// 逐点 / 桶级配速越界要各出一条提示（服务端可能按点或桶判，不按平均）。
+    ///
+    /// 把配速区间收到一个和生成轨迹明显不交的窄带，两种口径都应该报警；
+    /// 同时确认正常数据不会被误报（宁可漏报也不能让自检天天喊狼）。
+    #[test]
+    fn point_and_bucket_pace_ranges_are_checked() {
+        let (base, sim, sp) = sample();
+        let start = base[0].time_ms;
+        let mk = |pace: Option<(f64, f64)>, step: Option<(i64, i64)>| Check {
+            points: &base,
+            sim: &sim,
+            params: &sp,
+            checkpoints: &[],
+            total_distance_m: 2000,
+            total_time_sec: 720,
+            total_steps: 2300,
+            start_time_ms: start,
+            stop_time_ms: start + 720_000,
+            pace_range: pace,
+            step_range: step,
+            expected_interval_sec: None,
+        };
+        // 正常：2km/12min ⇒ 6'00"/km，放在 [4'00", 9'00"] 内不该报
+        let ok = inspect_at(&mk(Some((4.0, 9.0)), Some((60, 250))), None).lines().join("\n");
+        assert!(!ok.contains("PACE_OUT_BODY"), "正常区间不该报逐点越界：{ok}");
+        assert!(!ok.contains("BUCKET_PACE_OUT"), "正常区间不该报桶级越界：{ok}");
+
+        // 窄带：整个主体段都在区间外，两种口径都要报
+        let bad = inspect_at(&mk(Some((2.0, 3.0)), Some((60, 250))), None).lines().join("\n");
+        assert!(bad.contains("PACE_OUT_BODY"), "逐点越界没报：{bad}");
+        assert!(bad.contains("BUCKET_PACE_OUT"), "桶级越界没报：{bad}");
     }
 
     /// 「记录结束时间不得在服务器未来」必须由 `inspect_at` 真的拦下来。

@@ -73,6 +73,8 @@ pub struct RunParams {
     /// 用户清楚哪栋楼在哪，手画比算法猜靠谱——尤其 OSM 在该校区
     /// 零建筑数据、几何规划只能凭直线连点的时候。
     pub custom_path: Option<Vec<(f64, f64)>>,
+    /// 终点（可选）：给了就让轨迹收在这里，而不是绕回起点。
+    pub end: Option<(f64, f64)>,
     /// 是否尝试「按打卡点反推操场」。
     ///
     /// 控制台有「自动规划 / 操场绕圈」两个选项，这里必须如实反映用户选的那个：
@@ -415,6 +417,8 @@ fn try_route_on_tiles(
     want_m: f64,
     seed: u64,
     log: &mut dyn FnMut(&str),
+    // 终点是用户指定的点时禁止末尾折返（见 `route_through_ex`）
+    end_is_fixed: bool,
 ) -> Option<crate::track::fence_route::FenceRoute> {
     use crate::track::{roadnet, tileroad};
     let bbox = roadnet::bbox_of(fence, 60.0);
@@ -445,9 +449,33 @@ fn try_route_on_tiles(
     // 「不生硬」交给 soften：横向摆动 + 轻度平滑，让轨迹偏离道路中心线。
     let graph = tileroad::build_graph(&clipped, 25.0);
     let _ = start;
-    // 带上随机扰动：同一账号连日的记录不能是同一条折线（实测两条程序记录
-    // 重合度 100%，这是最容易被跑批认出来的形态）。
-    match tileroad::route_through_seeded(&graph, must, want_m, seed) {
+    let _ = seed;
+    // 把 must 里的点投影到最近的道路节点。
+    //
+    // `route_through` 只沿道路节点走，25m 内没有节点时会直接忽略那个点；
+    // 用户选的终点常落在草坪/楼前，于是「路网跑完停在边界、收尾拉一条
+    // 632m 直线」——既不在路上又容易被判跳变。这里先吸附，直线段就只剩
+    // 节点到终点的几十米。打卡点不吸（它们本来就在路上，且被 30m 校验守着）。
+    let mut snapped: Vec<(f64, f64)> = must.to_vec();
+    if let Some(last) = snapped.last_mut() {
+        let mut best = (f64::MAX, (0.0, 0.0));
+        for n in &graph.nodes {
+            let d = crate::track::geo::distance(*n, *last);
+            if d < best.0 {
+                best = (d, *n);
+            }
+        }
+        if best.0 <= 120.0 {
+            *last = best.1;
+            log(&format!(
+                "[tiles] 终点投影到最近道路节点，直线段从 {:.0}m 缩到 {:.0}m",
+                best.0, best.0
+            ));
+        }
+    }
+    // 指定终点时禁止末尾折返（折返会把末端带回几百米外）
+    match tileroad::route_through_seeded(&graph, &snapped, want_m, seed, end_is_fixed) {
+
         Ok(points) => {
             let max_gap = points
                 .windows(2)
@@ -627,6 +655,7 @@ impl Default for RunParams {
             prefer_roads: true,
             start_at_ms: None,
             custom_path: None,
+            end: None,
             alt_range: None,
             prefer_stadium: true,
         }
@@ -967,7 +996,18 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 不走这条：打卡点围成长方形是常见布局（教学楼四角、宿舍区），几何判据
     // 会把它认成跑道，然后在不是操场的地方画椭圆。
     let mut stadium_fallback = false;
-    let oval: Option<Vec<(f64, f64)>> = if should_try_stadium(p.run_mode, p.prefer_stadium) {
+    let want_stadium = should_try_stadium(p.run_mode, p.prefer_stadium);
+    // 指定了终点就别绕操场：操场是「按圈长铺满里程」的固定闭环，跑完自然回到
+    // 起点，没有收在某个点的说法。硬要收尾只能从环上拉一条直线过去，那是跳变。
+    // 所以这里的优先级是：**终点 > 操场**，并把原因写进日志。
+    let oval: Option<Vec<(f64, f64)>> = if want_stadium && p.end.is_some() {
+        if let Some((elat, elng)) = p.end {
+            log(&format!(
+                "[track] 指定了终点（{elat:.6},{elng:.6}），跳过操场绕圈——操场是按圈长铺满的固定闭环，收不到终点"
+            ));
+        }
+        None
+    } else if want_stadium {
         let seed0 = if p.seed != 0 { p.seed } else { start_ms as u64 };
         let got = try_stadium_track(&cps, p.distance_m, p.sample_step_m, seed0, log);
         stadium_fallback = got.is_none();
@@ -1094,6 +1134,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             actual_length_m: actual,
         }
     } else if fence_ring.len() >= 3 {
+        // 终点在下面的收尾处接（第 1265 行附近），不在这里改分支——
+        // 路网（OSM → 瓦片 → 几何三级）只接在这条路上，绕开它就没路网了。
         log(&format!(
             "[track] 围栏内规划 {}m，{} 个必经点…",
             p.distance_m,
@@ -1104,6 +1146,14 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         let _ = &mut rng;
 
         let must: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
+        // 路网规划的必经点里要带上终点：否则路网跑完还在边界上，收尾只能从
+        // 末端拉一条直线过去（实测 632m，既不在路上又容易被判跳变）。
+        // 终点只进**路网**的 must，不进 `resample_with_checkpoints` 的吸附列表——
+        // 它不是打卡点，不该被 15m 阈值拽动。
+        let mut route_must = must.clone();
+        if let Some(e) = p.end {
+            route_must.push(e);
+        }
         // 路线优先级：
         //   ① 沿围栏边界内缩跑——围墙边界一定是能走的路，绝不会落在湖面
         //      或楼里；形状也像人绕着校园跑。
@@ -1188,9 +1238,16 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         // 路网来源两级：OSM 优先（有真实道路等级和拓扑），拿不到再试高德
         // 瓦片。两级都失败才退回几何规划。
         let on_roads = if p.prefer_roads {
-            match try_route_on_roads(&fence_ring, &must, p.distance_m, seed, &mut *log) {
+            match try_route_on_roads(&fence_ring, &route_must, p.distance_m, seed, &mut *log) {
                 Some(r) => Some(r),
-                None => try_route_on_tiles(&fence_ring, &must, p.distance_m, seed, &mut *log),
+                None => try_route_on_tiles(
+                    &fence_ring,
+                    &route_must,
+                    p.distance_m,
+                    seed,
+                    &mut *log,
+                    p.end.is_some(),
+                ),
             }
         } else {
             None
@@ -1204,7 +1261,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             match crate::track::fence_route::route_through_in_order(
                 &fence_ring,
                 p.distance_m,
-                &must,
+                &route_must,
                 seed,
             ) {
                 Ok(r) => {
@@ -1298,12 +1355,28 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                 }
             }
         }
-        let sampled = crate::track::fence_route::resample_with_checkpoints(
+        let mut sampled = crate::track::fence_route::resample_with_checkpoints(
             &wandered,
             p.sample_step_m,
             &must,
             15.0,
         );
+        // 指定终点：把末点钉在终点上。
+        //
+        // 围栏路线是「沿边界/路网跑满里程」，末端自然落在路上，不一定是用户
+        // 选的终点。这里直接替换末点，等于最后一段从路网末端走到终点。
+        // 距离远会打日志——那段是直线，太长会被服务端的「相邻点跳变」挑。
+        if let Some(e) = p.end {
+            if let Some(last) = sampled.last().copied() {
+                let gap = crate::track::geo::distance(last, e);
+                if let Some(slot) = sampled.last_mut() {
+                    *slot = e;
+                }
+                log(&format!(
+                    "[track] 终点：末段从路网末端接过 {gap:.0}m（>200m 那段是直线，可能被判跳变）"
+                ));
+            }
+        }
         // 时间戳先占位：⑤ 的 retime 会按速度剖面重算并整体覆盖，
         // 这里算一遍是白算（原来 assign_times 的结果直接被丢弃，
         // 还让人误以为时间来自两处）。占位填 start_ms 即可。
@@ -1332,12 +1405,29 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             start_ms,
             sport_type: p.sport_type,
             sample_step_m: p.sample_step_m,
+            end: p.end,
         };
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
         let _ = &mut rng;
         plan(&req, &mut rng)?
     };
+    // 指定了终点就核对一下末点：planner 里已经钉住了，但 flow 后面还有
+    // 避让/采样/吸附几道处理，任何一道都可能把末点挪开。这里的日志是给
+    // 「App 里没跑到终点」这类反馈用的第一手证据。
+    if let Some((elat, elng)) = p.end {
+        if let Some(last) = track.points.last() {
+            let d = crate::track::geo::distance((last.lat, last.lon), (elat, elng));
+            log(&format!(
+                "[track] 终点核对：末点 ({:.6},{:.6}) 与设定终点 ({elat:.6},{elng:.6}) 相距 {d:.1}m",
+                last.lat, last.lon
+            ));
+            if d > 30.0 {
+                log("! [track] 末点没落在设定终点上：后续避让/吸附把它挪开了，检查 blockers 是否盖住终点");
+            }
+        }
+    }
+
     log(&format!(
         "√ [track] {} 点，实测 {:.1}m（目标 {:.0}m，偏差 {:.2}%）",
         track.points.len(),
@@ -1787,15 +1877,40 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 后来口径分了流（见 submit::PointTypeScheme）：带必到点的跑法才撒
     // `type=2`，没有必到点的跑法不发。数标记就不再可靠，改成直接数必到点
     // 数组，不依赖采样点 `type` 的口径。
-    let n_fixed = probe_sub
+    let fp_items: Vec<Value> = probe_sub
         .save_record
         .get("fivePointJson")
         .and_then(|v| v.as_str())
         .and_then(|x| serde_json::from_str::<Value>(x).ok())
         .and_then(|v| v.get("fivePointJson").cloned())
         .and_then(|v| v.as_str().and_then(|x| serde_json::from_str::<Vec<Value>>(x).ok()))
-        .map(|v| v.len())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let n_fixed = fp_items.len();
+
+    // isPass 必须全 true —— App 详情页就按它画绿点。
+    //
+    // 少一个就少画一个绿点（4 绿 1 橙）。成因通常是：起点(`type=7`) 或起步
+    // 窗口的灰点(`type=-1`) 把某个必到点 10m 命中圈里唯一的采样点占掉了，
+    // `type=2` 还能靠 Relaxed 兜到圈外，但 `isPass` 用的是严格 10m，于是 false。
+    //
+    // 这种记录发出去等于白跑一次（App 里那个点是橙的），所以拦在本地。
+    let not_passed: Vec<String> = fp_items
+        .iter()
+        .filter(|p| p.get("isPass").and_then(|v| v.as_bool()) == Some(false))
+        .map(|p| {
+            p.get("pointName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(未命名)")
+                .to_string()
+        })
+        .collect();
+    if !not_passed.is_empty() {
+        return Err(format!(
+            "有 {} 个必到点是 isPass=false：{}。\n    App 详情页会显示成橙点，这次打卡等于没算。\n    成因通常是起点或起步窗口的采样点占掉了该点位 10m 内唯一的采样点。\n    处理：把「纬度/经度」锚点挪到离这些点位 20m 以外再跑，或者换一个场地。",
+            not_passed.len(),
+            not_passed.join("、")
+        ));
+    }
     if !fixed.is_empty() && n_fixed != fixed.len() {
         return Err(format!(
             "自检点位里必到点数量对不上（报文 {n_fixed} 个，应有 {} 个）：probe 的 fixed 传空了？",

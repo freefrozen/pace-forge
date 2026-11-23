@@ -731,6 +731,19 @@ fn handle_login(request: tiny_http::Request, state: Shared, body: &Value) -> Res
 /// 服务端的围栏、打卡点，以及规划器内部的几何全是 BD-09；前端地图用的
 /// 却是高德瓦片（GCJ-02 网格）。所以外部坐标进规划器之前必须先落到
 /// BD-09，否则整条轨迹会整体平移 400~600 米，看起来「跑了但点全错」。
+/// 解析前端给的终点（可选）。坐标口径与锚点一致（默认 GCJ-02，服务端要 BD-09）。
+///
+/// 两个字段都没填、或都是 0，就当没指定终点——保持原来的闭环行为。
+fn parse_end(body: &Value) -> Option<(f64, f64)> {
+    let la = body["endLat"].as_f64()?;
+    let ln = body["endLng"].as_f64()?;
+    if la == 0.0 && ln == 0.0 {
+        return None;
+    }
+    let cs = body["coord"].as_str().unwrap_or("gcj02");
+    input_to_bd09(la, ln, cs).ok()
+}
+
 fn input_to_bd09(lat: f64, lng: f64, sys: &str) -> Result<(f64, f64), String> {
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
         return Err(format!("经纬度超出范围: ({lat}, {lng})"));
@@ -828,6 +841,7 @@ fn handle_plan(
                 run_mode,
                 start_at_ms,
                 custom_path: parse_custom_path(body),
+                end: parse_end(body),
                 alt_range: parse_alt_range(body),
                 prefer_stadium: body["mode"].as_str() == Some("stadium"),
                 prefer_roads: body["preferRoads"].as_bool().unwrap_or(true),
@@ -1004,6 +1018,7 @@ fn handle_plan(
             // （1.93km/406 点、1.81km/375 点、2.04km/419 点），
             // 改成 10m 点数就只剩一半，反而和真机对不上。
             sample_step_m: 5.0,
+            end: None,
         };
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(start_ms as u64);

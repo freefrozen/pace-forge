@@ -17,7 +17,6 @@
 
 use serde_json::Value;
 
-use super::records;
 
 /// 一条历史记录的轻量视图。
 #[derive(Debug, Clone, Copy)]

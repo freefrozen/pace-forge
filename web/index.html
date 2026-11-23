@@ -554,6 +554,7 @@ button.danger:hover:not(:disabled) { background: var(--danger-hi); border-color:
         </div>
         <button id="drawStart" class="ghost">开始绘制</button>
         <button id="drawUndo" class="ghost">撤销上一笔</button>
+        <button id="drawErase" class="ghost" title="按住划过要删掉的那一段，只擦局部，不用重画整圈">橡皮</button>
         <button id="drawClear" class="ghost">清空</button>
         <button id="drawUse">用这条轨迹</button>
         <span id="drawInfo" class="hint" style="margin-left:8px"></span>
@@ -582,6 +583,16 @@ button.danger:hover:not(:disabled) { background: var(--danger-hi); border-color:
         <pre id="ncOut" class="mono" style="display:none;flex-basis:100%;margin:6px 0 0;font-size:11px;line-height:1.6;white-space:pre-wrap;color:var(--dim)"></pre>
       </div>
 
+      <div id="endWrap" style="flex-basis:100%;display:flex;gap:8px;align-items:flex-end;
+           flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)">
+        <label style="margin:0">终点纬度<input id="endLat" class="coord-input" type="number" step="0.000001"
+               placeholder="留空=绕回起点" aria-label="终点纬度"></label>
+        <label style="margin:0">终点经度<input id="endLng" class="coord-input" type="number" step="0.000001"
+               placeholder="留空=绕回起点" aria-label="终点经度"></label>
+        <button class="ghost" id="endPick">在地图上点终点</button>
+        <button class="ghost" id="endClear">清除终点</button>
+        <span id="endInfo" class="hint">留空时跑完绕回起点；填了就收在终点</span>
+      </div>
       <div id="blockWrap" style="flex-basis:100%;margin-top:6px">
         <button id="blockStart" class="ghost">标注禁区（画楼）</button>
         <button id="blockUndo" class="ghost">撤销上一块</button>
@@ -909,7 +920,13 @@ function syncDurHint() {
 
 ['rAutoDur', 'rPaceMin', 'rPaceMax', 'rDist'].forEach(id => {
   const el = $(id);
-  if (el) { el.oninput = syncDurHint; el.onchange = syncDurHint; }
+  if (el) {
+    el.oninput = syncDurHint;
+    el.onchange = syncDurHint;
+    // 改目标距离时，手绘面板那行「还差 X m」也要跟着变，
+    // 不然用户画完再去调距离，看到的还是旧差值。
+    el.addEventListener('input', () => { if (strokes.length) redrawStrokes(); });
+  }
 });
 syncDurHint();
 
@@ -937,6 +954,7 @@ $('planBtn').onclick = async () => {
         runMode: parseInt($('rRunMode').value, 10) || 1,
         startAtMs: (st ? st.startMs : undefined),
         ...locBody(),
+        ...endBody(),
         customPath: $('rMode').value === 'draw'
           ? (() => { const m = useDrawing(); return m && m.length >= 2 ? m : undefined; })()
           : undefined
@@ -1063,6 +1081,7 @@ $('runBtn').onclick = async () => {
         ...altBody(),
         startAtMs: (st ? st.startMs : undefined),
         ...locBody(),
+        ...endBody(),
         // 手绘模式把坐标带上；后端按 WGS84 解析并转 BD-09
         customPath: $('rMode').value === 'draw'
           ? (() => {
@@ -1730,6 +1749,41 @@ function readLocInputs() {
   return { lat: lat, lng: lng, coord: $('llCoord').value };
 }
 
+// 终点：留空 = 保持原来的闭环（跑完回起点）；填了 = 收在这里。
+// 服务端要 BD-09，前端输入是底图坐标（GCJ-02），转换在后端做（与锚点同一套）。
+let endPickMode = false;
+let endMarker = null;
+function readEndInputs() {
+  const lat = parseFloat($('endLat').value);
+  const lng = parseFloat($('endLng').value);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  if (isPlaceholderCoord(lat) || isPlaceholderCoord(lng)) return null;
+  return { lat: lat, lng: lng };
+}
+function endBody() {
+  const v = readEndInputs();
+  return v ? { endLat: v.lat, endLng: v.lng } : {};
+}
+function drawEndMarker() {
+  if (!map) return;
+  if (endMarker) { map.removeLayer(endMarker); endMarker = null; }
+  const v = readEndInputs();
+  if (!v) { $('endInfo').textContent = '留空时跑完绕回起点'; return; }
+  endMarker = L.circleMarker([v.lat, v.lng], {
+    radius: 7, color: tok('--danger'), fillColor: tok('--danger'), fillOpacity: .85, weight: 2,
+  }).addTo(map).bindTooltip('终点');
+  $('endInfo').textContent = '终点已设：跑完收在这里';
+}
+function setEndPickMode(on) {
+  endPickMode = !!on;
+  $('endPick').textContent = endPickMode ? '点地图上的终点…' : '在地图上点终点';
+  if (map) map.getContainer().style.cursor = (endPickMode || pickMode) ? 'crosshair' : '';
+  if (endPickMode && drawMode) setDrawMode(false);
+  if (endPickMode && pickMode) setPickMode(false);
+  if (endPickMode && blockMode) setBlockMode(false);
+}
+
 // 只把有值的字段塞进请求体；留空时后端照旧走围栏
 function locBody() {
   const v = readLocInputs();
@@ -1933,6 +1987,13 @@ function initLoc() {
     syncLocToMap();
   };
   $('llPick').onclick = () => setPickMode(!pickMode);
+  $('endPick').onclick = () => setEndPickMode(!endPickMode);
+  $('endClear').onclick = () => {
+    $('endLat').value = '';
+    $('endLng').value = '';
+    drawEndMarker();
+  };
+  ['endLat', 'endLng'].forEach(id => { $(id).onchange = drawEndMarker; });
   $('llClear').onclick = clearLoc;
 
   // 打字过程中不要每敲一位就跳一次地图，停下来再同步
@@ -1956,6 +2017,14 @@ function initLoc() {
   // 点选改走 Leaflet 的 click：它自己区分了「拖动地图」和「点一下」，
   // 比在 pointerdown 上抢事件可靠——拖动结束时的 pointerdown 会被误判成点选。
   map.on('click', ev => {
+    if (endPickMode) {
+      const ll = ev.latlng;
+      $('endLat').value = ll.lat.toFixed(6);
+      $('endLng').value = ll.lng.toFixed(6);
+      setEndPickMode(false);
+      drawEndMarker();
+      return;
+    }
     if (!pickMode) return;
     setPickLocation(ev.latlng.lat, ev.latlng.lng, true);
     setPickMode(false);
@@ -2023,6 +2092,39 @@ function metersBetween(a, b) {
   const x = dLng * Math.cos(rad((a[0] + b[0]) / 2));
   return R * Math.sqrt(x * x + dLat * dLat);
 }
+// 橡皮：按住划过的地方，删掉半径内的手绘点。
+//
+// 手绘最常见的修正是「某一段画歪了 / 穿进楼里了」。整笔撤销太粗（一笔就是
+// 半圈），清空重画更亏。这里只删局部点，删断的地方按段拆成独立笔画，
+// 用户补一笔接回去即可。
+let eraseMode = false;
+let isErasing = false;
+const ERASE_RADIUS_M = 12;
+
+function eraseAt(lat, lng) {
+  let touched = false;
+  for (let si = strokes.length - 1; si >= 0; si--) {
+    const st = strokes[si];
+    const pieces = [];
+    let seg = [];
+    for (const q of st) {
+      if (metersBetween(q, [lat, lng]) <= ERASE_RADIUS_M) {
+        touched = true;
+        if (seg.length >= 2) pieces.push(seg);
+        seg = [];
+      } else {
+        seg.push(q);
+      }
+    }
+    if (seg.length >= 2) pieces.push(seg);
+    // 没改动就别动这一笔（pieces 会等于原笔，但对象不同，比较段数+首尾更稳）
+    if (!(pieces.length === 1 && pieces[0].length === st.length)) {
+      strokes.splice(si, 1, ...pieces);
+    }
+  }
+  if (touched) redrawStrokes();
+}
+
 function strokesLength() {
   let m = 0;
   for (const st of strokes) {
@@ -2069,6 +2171,34 @@ function redrawStrokes() {
     }
     txt += ` · 点位 ${hit}/${lastCheckpoints.length}`;
     if (missed.length) txt += `（漏 ${missed.join(',')}）`;
+  }
+  // 目标里程 vs 实际画了多长 —— 后端只会往日志写一句，界面上看不见。
+  // 画短了照样能提交，但成绩按实际里程算，等于白画；这里当场告诉用户差多少。
+  if (strokes.length) {
+    const targetKm = parseFloat($('rDist') && $('rDist').value);
+    const drawnKm = m / 1000;
+    if (Number.isFinite(targetKm) && targetKm > 0) {
+      const diff = targetKm - drawnKm;
+      if (diff > targetKm * 0.1) {
+        txt += ` · 目标 ${targetKm.toFixed(2)} km，还差 ${(diff * 1000).toFixed(0)} m`;
+      } else if (diff < -targetKm * 0.3) {
+        // 画多了不会报错，但成绩只看实际里程，多出来的白跑
+        txt += ` · 比目标多 ${(-diff * 1000).toFixed(0)} m（成绩按 ${drawnKm.toFixed(2)} km 算）`;
+      } else {
+        txt += ` · 目标 ${targetKm.toFixed(2)} km ✓`;
+      }
+    }
+    // 首尾没接上：后端只在 1~120m 之间自动补一段，超了就不补，
+    // 提交时会被判「相邻点跳变」。这条比里程差更要紧，必须当场说。
+    const flatAll = [];
+    for (const st of strokes) flatAll.push(...st);
+    if (flatAll.length >= 2) {
+      const gap = metersBetween(flatAll[0], flatAll[flatAll.length - 1]);
+      if (gap > 120) {
+        txt += ` · ⚠ 起点和终点差 ${gap.toFixed(0)} m，超过 120 m 不会自动接上，`;
+        txt += `提交会被判跳变，建议补一笔接回去`;
+      }
+    }
   }
   $('drawInfo').textContent = txt;
 }
@@ -2232,6 +2362,14 @@ function initDrawing() {
       return;
     }
     if (!drawMode) return;
+    if (eraseMode) {
+      ev.preventDefault();
+      isErasing = true;
+      try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+      const p = toLatLng(ev);
+      eraseAt(p.lat, p.lng);
+      return;
+    }
     ev.preventDefault();
     isPointerDown = true;
     el.setPointerCapture(ev.pointerId);
@@ -2244,6 +2382,12 @@ function initDrawing() {
   el.addEventListener('pointermove', ev => {
     if (blockMode && blockStart && blockTemp) {
       blockTemp.setBounds(L.latLngBounds(blockStart, toLatLng(ev)));
+      return;
+    }
+    if (isErasing) {
+      ev.preventDefault();
+      const p = toLatLng(ev);
+      eraseAt(p.lat, p.lng);
       return;
     }
     if (!drawMode || !isPointerDown || !currentStroke) return;
@@ -2270,6 +2414,12 @@ function initDrawing() {
       }
       return;
     }
+    if (isErasing) {
+      isErasing = false;
+      try { el.releasePointerCapture(ev.pointerId); } catch (e) {}
+      redrawStrokes();
+      return;
+    }
     if (!isPointerDown) return;
     isPointerDown = false;
     currentStroke = null;
@@ -2282,6 +2432,14 @@ function initDrawing() {
 
   $('drawStart').onclick = () => setDrawMode(!drawMode);
   $('drawUndo').onclick = () => { strokes.pop(); redrawStrokes(); };
+  $('drawErase').onclick = () => {
+    eraseMode = !eraseMode;
+    $('drawErase').textContent = eraseMode ? '橡皮（开）' : '橡皮';
+    // 没有现成的按钮激活类，直接用强调色标一下，省得改一套 CSS
+    $('drawErase').style.color = eraseMode ? 'var(--accent)' : '';
+    $('drawErase').style.borderColor = eraseMode ? 'var(--accent)' : '';
+    setOut(eraseMode ? '橡皮已开：按住划过要删的那一段（12m 内）' : '橡皮已关，回到绘制');
+  };
   $('drawClear').onclick = clearDrawing;
   $('drawUse').onclick = () => {
     const merged = useDrawing();

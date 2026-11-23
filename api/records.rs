@@ -3,6 +3,11 @@
 //! - 列表：`POST /api/v70230/runnings/records` `{pageNum, pageSize, sid, type}`
 //! - 详情：`POST /api/v70320/runnings/get_one_record` `{rrid}`
 //!
+//!   ⚠️ 7.4.20 客户端的 Dart 层用的是 **`v70260`**（`libapp.so` 里
+//!   `v70260/runnings/get_one_record`），`v70320` 只出现在 `classes.dex`，
+//!   说明两套都还在用。我们保留 v70320 是因为实测可用；改回 v70260 需要
+//!   一次真机验证（旧结论「App 从不用 v70320」在 7.4.20 上不成立，已撤回）。
+//!
 //! 列表接口不含轨迹；详情接口是否含轨迹取决于服务端配置。
 //! 前端对原始 JSON 做自动探测，遇到坐标数组就画地图，所以这里原样透传 `raw`。
 

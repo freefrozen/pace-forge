@@ -1847,6 +1847,7 @@ mod checkpoint_hit_tests {
             start_ms: START_MS,
             sport_type: 1,
             sample_step_m: 5.0,
+            end: None,
         };
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let planned = plan(&req, &mut rng)?;

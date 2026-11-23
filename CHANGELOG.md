@@ -8,6 +8,22 @@
 
 详细说明见 `docs/release-notes/<tag>.md`。
 
+## 未发布（main，待发 v0.1.11）
+
+> 核心：按 7.4.20 真机（脱壳 + 真机报文）对齐提交体与设备头。**实测一条 2km/12min
+> 提交成功、App 详情页 5 个绿点、无 201。** 如果升级后提交异常，回滚 v0.1.10。
+
+- **[行为变化]** 提交体四个字段对齐真机 7.4.20：`segmentJson` 空串（不是 `"[]"`）、`more=true`、`prizeName=null`、`appVersion` 默认 `7.4.20`（`PACE_APP_VERSION` 可覆盖）。依据：对 7.4.20 真 dex 的脱壳（JustLikeCheese fork `3616b217`/`06a06399`）
+- **[行为变化]** `CustomDeviceId` 纳入 `PACE_DEVICE_HW_HEADERS` 开关（默认仍发派生值）；五个硬件头一起清空，`DeviceId` 不受影响
+- **[行为变化]** 提交前拦 `isPass=false`：App 详情页会显示橙点、这次打卡等于没算，宁可本地失败
+- **[行为变化]** 自检新增逐点与 10 秒桶的配速/步频区间校验（`PACE_OUT_BODY` / `BUCKET_PACE_OUT` / `BUCKET_CADENCE_OUT`），阈值按真机基线定（点级 15%、桶级 10%），只提示不拦
+- **[仅修复]** `PACE_FORGE_DATA_DIR` 真正生效：设了就整个数据目录跟着走，不再「config 说生效、实际仍读写 `~/.pace-forge`」（#21）
+- **[仅修复]** 空白瓦片当合法结果：高德无道路区回 ~179B 纯色 PNG，原来被判失败并进 10 分钟冷却（#2）
+- **[仅修复]** `audit` 三处：闭合轨迹的反向判定（原先恒判反向、`AUDIT_OVERLAP` 被永久静音）、只看最高一对导致漏报、`suggest` 打出字面 `{}`
+- **[仅修复]** `suggest` 补一条出口建议（三个风控维度里唯一能当场查的）
+- **[仅修复]** `tracks --top N`：缺值/非整数/越界/未知参数一律 `exit 2`，不再静默全量输出（#26 follow-up）
+- **[仅文档]** 新增 `docs/notes/REVERSE-BASELINE.md`：撤回三条旧结论（38 端点、从不用 v70320、dex 只有壳）、`consts.rs` 出处更正、两条真机采样点距差 3 倍的教训、设备侧抓包边界
+
 ## v0.1.10（未发布）
 
 - **[行为变化]** 新增 `pace-forge audit` / `suggest` / `tracks`：账号体检（连续性、时段集中度、里程/配速离散、轨迹重合矩阵），命中只提示、不拦提交；检查码前缀 `AUDIT_*`，与 preflight 的 `PACE_*` 分开（#14）

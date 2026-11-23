@@ -835,15 +835,25 @@ pub fn route_through(
     must: &[(f64, f64)],
     want_m: f64,
 ) -> Result<Vec<(f64, f64)>, String> {
-    let mut fixed = || 0u64;
-    route_through_seeded_inner(g, must, want_m, &mut fixed)
+    route_through_ex(g, must, want_m, false)
 }
 
-fn route_through_seeded_inner(
+/// 同 `route_through`，但把「随机扰动」这件事留成显式入口。
+///
+/// 上游 v0.1.11 起主链路是「先吸附终点 → 再 `route_through_ex`」（`fix_end`
+/// 控制要不要末尾折返）。这里的种子目前只驱动**折返扰动**（`inject_detours`，
+/// 默认关），随机的「延伸段选点」暂时让位给 fix_end——两件事都动
+/// 同上，但可以**禁止末尾折返**。
+///
+/// `fix_end = true` 时，里程不够也不再「原路往回走一段」——因为用户指定了
+/// 终点，那段折返会把末端带回几百米外，终点就白设了。代价是实际里程可能
+/// 短于目标（少掉折返那部分），由调用方决定接不接受。
+pub fn route_through_ex(
     g: &RoadGraph,
     must: &[(f64, f64)],
     want_m: f64,
-    next: &mut impl FnMut() -> u64,
+    fix_end: bool,
+
 ) -> Result<Vec<(f64, f64)>, String> {
     if must.len() < 2 {
         return Err("至少要两个点".into());
@@ -872,7 +882,17 @@ fn route_through_seeded_inner(
     // 闭环回到起点是「来回跑」的根：5 个点跨度 500m、目标 2000m，回程
     // 1400m 无论怎么绕都要用主干道，实测重复率 47%，闭环比开放路径差
     // 一大截。真实跑步里跑完停在别处本来也常见。
-    for i in 0..must.len() - 1 {
+    // `fix_end` 时终点不参与「凑里程」：先把 must[..n-1] 连起来、绕够里程，
+    // 最后再单独 A* 走一段到终点。否则凑里程的 while 循环会把终点变成中途点，
+    // 收尾仍然要拉几百米直线（实测 583m）。
+    // fix_end 时主循环只连到倒数第二个必到点：终点必须留到最后一段，
+    // 否则「到达终点后还要继续凑里程」又会把它变成中途点。
+    let connect_end = if fix_end && must.len() >= 2 {
+        must.len() - 2
+    } else {
+        must.len() - 1
+    };
+    for i in 0..connect_end {
         let a = g.nearest(must[i]);
         let b = g.nearest(must[i + 1]);
 
@@ -924,6 +944,11 @@ fn route_through_seeded_inner(
     let all_zones: HashSet<usize> = zones.iter().flatten().copied().collect();
     let mut total: f64 = path_len(g, &path);
     let mut hops = 0;
+    let end_zone: HashSet<usize> = if fix_end {
+        zones.last().cloned().unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
     while total < want_m - 150.0 && hops < 5 {
         hops += 1;
         let last = *path.last().unwrap();
@@ -935,7 +960,17 @@ fn route_through_seeded_inner(
             if all_zones.contains(&m) || m == last {
                 continue;
             }
+            // fix_end：凑里程时不能钻进终点周围，否则最后一段又从终点
+            // 折回来，收尾还是要拉直线
+            if end_zone.contains(&m) {
+                continue;
+            }
             if !d.is_finite() || d < 120.0 {
+                continue;
+            }
+            // 别选远超剩余量的点：排除终点区域后候选变少，选太远的一下
+            // 就把里程冲过头（实测目标 2000 跑出 2663）。
+            if d > need * 1.2 {
                 continue;
             }
             // 选最接近剩余里程的。这里不设偏差上限——路网就这么大，
@@ -965,23 +1000,16 @@ fn route_through_seeded_inner(
             .map(|(i, _)| i)
             .collect();
         band.sort_unstable();
-        // 延伸段默认**不加随机**：走「最接近剩余里程」的那个节点，路线形状
-        // 才稳定，打卡点次序也不会被延伸段扫到（实测强随机会让 #4 抢到 #2 前面）。
-        // 「同一条路、每天差十几米」这件事交给下游的横向摆动（`soften`）。
-        // 想要「每天换一条街」的强随机，再开 `PACE_ROUTE_RANDOM=1`。
-        let strong = std::env::var("PACE_ROUTE_RANDOM").ok().as_deref() == Some("1");
+        // 延伸段走「最接近剩余里程」的那个节点（确定性）：路线形状稳定，
+        // 打卡点次序也不会被延伸段扫到。合并上游 v0.1.11 后不再在这里做随机，
+        // 「同一条路、每天差十几米」交给下游横向摆动（`soften`）与
+        // `route_through_seeded` 的折返扰动。
         let mut near: Vec<(f64, usize)> = band
             .iter()
             .map(|i| ((de[*i] - need).abs(), *i))
             .collect();
         near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let m = if near.is_empty() {
-            m
-        } else if strong {
-            near[(next() as usize) % near.len().min(3)].1
-        } else {
-            near.remove(0).1
-        };
+        let m = if near.is_empty() { m } else { near.remove(0).1 };
         let Some(tail) = astar_penalized(g, last, m, &used, 4.0, &HashSet::new()) else {
             break;
         };
@@ -992,9 +1020,22 @@ fn route_through_seeded_inner(
         total = path_len(g, &path);
     }
 
+    // fix_end：最后单独走一段到终点（前面所有凑里程都在它之前完成）。
+    if fix_end && must.len() >= 2 {
+        let a = *path.last().unwrap();
+        let b = g.nearest(*must.last().unwrap());
+        if a != b {
+            if let Some(seg) = astar(g, a, b) {
+                path.extend(seg.into_iter().skip(1));
+            } else {
+                return Err("最后一段到终点的路网不连通".into());
+            }
+        }
+    }
+
     // 还差一截就从终点原路折返。折返只重复缺口的一半，重复率大约是
     // 缺口的 1/4，比按圈重复整圈好得多。
-    if total < want_m {
+    if total < want_m && !fix_end {
         let need = want_m - total;
         let mut acc = 0.0;
         let mut cut = path.len().saturating_sub(1);
@@ -1030,6 +1071,7 @@ pub fn route_through_seeded(
     must: &[(f64, f64)],
     want_m: f64,
     seed: u64,
+    fix_end: bool,
 ) -> Result<Vec<(f64, f64)>, String> {
     let mut rng_seed = seed | 1;
     let mut next = || {
@@ -1040,7 +1082,9 @@ pub fn route_through_seeded(
         rng_seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
     };
 
-    let base = route_through_seeded_inner(g, must, want_m, &mut next)?;
+    // 主链路走上游 `route_through_ex`（含终点吸附与 fix_end 语义），
+    // 随机扰动只保留「折返」这一层（默认 0 段，`PACE_DETOURS` 开启）。
+    let base = route_through_ex(g, must, want_m, fix_end)?;
     Ok(inject_detours(g, base, must, &mut next))
 }
 

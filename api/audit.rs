@@ -269,6 +269,41 @@ pub fn findings(m: &Metrics) -> Vec<Finding> {
     out
 }
 
+/// 解析 `tracks` 的子命令参数：`[records.json] [--top N]`。
+///
+/// 参数写错必须报错，不能当成「没写」——`--top abc` 静默回落会打出全部
+/// 4950 对，和 v0.1.9 立的规矩相反（写错与没写后果差得远，见 #23）。
+///
+/// 放在 lib 里而不是 `main.rs`：CI 跑的是 `cargo test --lib`，写在 main 里
+/// 的测试不会被执行。
+pub fn parse_tracks_args(args: &[String]) -> Result<(Option<String>, Option<usize>), String> {
+    let mut file: Option<String> = None;
+    let mut top: Option<usize> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--top" => {
+                let v = it.next().ok_or("--top 缺少次数，例如 --top 20")?;
+                let n: usize = v
+                    .parse()
+                    .map_err(|_| format!("--top 不是整数：「{v}」"))?;
+                if !(1..=5000).contains(&n) {
+                    return Err(format!("--top 需在 1..5000 之间，收到 {n}"));
+                }
+                top = Some(n);
+            }
+            s if s.starts_with("--") => return Err(format!("未知参数：{s}")),
+            s => {
+                if file.is_some() {
+                    return Err(format!("多余的参数：{s}（只接一个记录文件）"));
+                }
+                file = Some(s.to_string());
+            }
+        }
+    }
+    Ok((file, top))
+}
+
 /// 把发现翻成动作。每条都指向「下一条记录怎么跑」，不是抽象建议。
 pub fn suggestions(m: &Metrics, found: &[Finding]) -> Vec<String> {
     let mut out = Vec::new();
@@ -305,7 +340,17 @@ pub fn suggestions(m: &Metrics, found: &[Finding]) -> Vec<String> {
     if out.is_empty() {
         out.push("这几条指标没到阈值，照现在的节奏跑就行；阈值只是经验值，不是协议规则。".into());
     }
-    out.push("出口 IP 那条另看：`pace-forge audit` 不探网络，顶栏那行才代表提交时的真实出口。".into());
+    // 出口：这是三个风控维度里唯一能当场查的（时段/频率要靠自己记）。
+    // 不联网，只读配置——`audit` 是离线命令，探测留给顶栏。
+    match crate::api::egress::current_proxy() {
+        Some(p) => out.push(format!(
+            "提交走代理出口（{p}）——它的归属地必须和校区同城，不同城就别跑；确认一次，别每次都赌。"
+        )),
+        None => out.push(
+            "提交走本机网络——开 `pace-forge web` 看顶栏那行出口 IP，不在校区同城就先换网络再跑。"
+                .into(),
+        ),
+    }
     out
 }
 
@@ -464,9 +509,45 @@ mod tests {
         assert!(!s.iter().any(|x| x.contains("{}")), "冒出了未填充的占位符: {s:?}");
         assert!(s.iter().any(|x| x.contains("换方向")), "{s:?}");
         assert!(s.iter().any(|x| x.contains("里程按")), "{s:?}");
+        // 出口那条无论配没配代理都要给（这是三个风控维度里唯一能当场查的）
+        assert!(
+            s.iter().any(|x| x.contains("出口")),
+            "suggest 必须提示出口：{s:?}"
+        );
         // 没有命中时也要给一句，不能空手回去
         let clean = suggestions(&metrics(&[]), &[]);
         assert!(!clean.is_empty());
+    }
+
+    #[test]
+    fn tracks_args_accept_valid_forms() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_tracks_args(&args(&[])).unwrap(), (None, None));
+        assert_eq!(
+            parse_tracks_args(&args(&["rec.json"])).unwrap(),
+            (Some("rec.json".to_string()), None)
+        );
+        assert_eq!(
+            parse_tracks_args(&args(&["rec.json", "--top", "20"])).unwrap(),
+            (Some("rec.json".to_string()), Some(20))
+        );
+        // 顺序反过来也要认
+        assert_eq!(
+            parse_tracks_args(&args(&["--top", "3", "rec.json"])).unwrap(),
+            (Some("rec.json".to_string()), Some(3))
+        );
+    }
+
+    /// 写错要报错，不能静默变成「没写」。
+    #[test]
+    fn tracks_args_reject_bad_values() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(parse_tracks_args(&args(&["rec.json", "--top"])).is_err(), "缺值");
+        assert!(parse_tracks_args(&args(&["rec.json", "--top", "abc"])).is_err(), "非整数");
+        assert!(parse_tracks_args(&args(&["rec.json", "--top", "0"])).is_err(), "下界");
+        assert!(parse_tracks_args(&args(&["rec.json", "--top", "99999"])).is_err(), "上界");
+        assert!(parse_tracks_args(&args(&["--bogus", "rec.json"])).is_err(), "未知参数");
+        assert!(parse_tracks_args(&args(&["a.json", "b.json"])).is_err(), "多余文件");
     }
 
     #[test]

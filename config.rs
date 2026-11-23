@@ -104,7 +104,7 @@ const ENTRIES: &[Entry] = &[
     Entry {
         name: "PACE_DEVICE_HW_HEADERS",
         default: "derived（发派生值）",
-        effect: "empty = 四个可选硬件头（androidId/blMac/wifiMac/IMEI）发空串，做对照实验用",
+        effect: "empty = 五个可选硬件头（androidId/blMac/wifiMac/IMEI/CustomDeviceId）发空串，做对照实验用；DeviceId 不受影响",
         default_value: Some("derived"),
         kind: Kind::Enum(&["derived", "empty"]),
     },
@@ -127,6 +127,13 @@ const ENTRIES: &[Entry] = &[
         default: "未设置（直连）",
         effect: "http://host:port。提交链路走这个出口，本机直连 / 代理 / 隧道都行；非法值只报一次并按直连走",
         default_value: None,
+        kind: Kind::Str,
+    },
+    Entry {
+        name: "PACE_APP_VERSION",
+        default: "7.4.20",
+        effect: "上报的 appVersion，默认取真机版本（7.4.20 / code 411）。改它等于自报用别的客户端版本",
+        default_value: Some("7.4.20"),
         kind: Kind::Str,
     },
     Entry {

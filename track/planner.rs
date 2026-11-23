@@ -45,6 +45,11 @@ pub struct PlanRequest {
     pub sport_type: i32,
     /// 采样间隔（米）。越小越密，报文越大。
     pub sample_step_m: f64,
+    /// 终点（可选）。给了就让轨迹**收在**这里，而不是绕回起点。
+    ///
+    /// 里程会先把「最后一点 → 终点」那段预留出来，尾巴续走时不会冲过头；
+    /// 之后正常的里程对齐（容差 15%）再吸收几十米的误差。
+    pub end: Option<(f64, f64)>,
 }
 
 impl Default for PlanRequest {
@@ -58,6 +63,7 @@ impl Default for PlanRequest {
             start_ms: 0,
             sport_type: 1,
             sample_step_m: 5.0,
+            end: None,
         }
     }
 }
@@ -184,7 +190,13 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     // 行进方向无关，接上去就是一次接近 180° 的掉头，地图上一根刺。而且剩余
     // 距离不足时那个圆只有几米半径，采样间隔 5m，等于原地转圈。
     // 沿环续走天然连续：接的是主环上的下一个点。
-    let remaining = req.total_distance_m - ring_len * laps as f64;
+    // 终点要占掉一段里程：先算「最后一点 → 终点」，从剩余量里扣掉，
+    // 否则尾巴会把里程跑满，再把终点追加进去就超了。
+    let to_end = req
+        .end
+        .map(|e| super::geo::distance(*route.last().unwrap(), e))
+        .unwrap_or(0.0);
+    let remaining = (req.total_distance_m - ring_len * laps as f64 - to_end).max(0.0);
     if remaining > 0.0 && ring.len() > 1 {
         let open: Vec<(f64, f64)> = ring[..ring.len() - 1].to_vec();
         let mut acc = 0.0;
@@ -203,9 +215,21 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
         }
     }
 
+    // 终点：所有圈和尾巴跑完后收在这里（不指定就保持原来的闭环行为）
+    if let Some((elat, elng)) = req.end {
+        route.push((elat, elng));
+    }
+
     // 3. 密集采样
     let n = ((req.total_distance_m / req.sample_step_m).round() as usize).max(8);
     let mut flat: Vec<(f64, f64)> = sample_along(&route, n);
+    // 等距采样不会正好落在 route 末尾，末点因此可能离终点几十米。
+    // 显式钉住，后面缩放时也把它锁死（见 scale_to_length 的锚点）。
+    if let Some(e) = req.end {
+        if let Some(last) = flat.last_mut() {
+            *last = e;
+        }
+    }
 
 
     // 4. 时间戳：等间隔 + 末点精确对齐
@@ -216,7 +240,13 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     // 保持串点位后的自然形状。硬缩放到精确 2.000 km 会把整条线拉伸，
     // 反而容易把点拉进建筑物里。
     let tol = super::geo::length_tolerance(req.total_distance_m);
-    let (_len, _) = scale_to_length(&mut flat, req.total_distance_m, &[0], tol);
+    // 有终点时锁住首尾两端，缩放不能把终点拉走
+    let anchors: Vec<usize> = if req.end.is_some() {
+        vec![0, n - 1]
+    } else {
+        vec![0]
+    };
+    let (_len, _) = scale_to_length(&mut flat, req.total_distance_m, &anchors, tol);
 
     // 6. 打卡点吸附 + 再次对齐 + 归位
     let mut anchor_idx = Vec::new();
@@ -250,7 +280,7 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     // 存成 blockers.json；这里对所有走 planner 的路径（Web 预览、CLI、兜底）
     // 统一生效，跟 flow::build 里那条路保持一致。
     let blockers = crate::track::roadnet::load_local_blockers();
-    let (flat, times) = if blockers.is_empty() || flat.len() < 3 {
+    let (mut flat, times) = if blockers.is_empty() || flat.len() < 3 {
         (flat, times)
     } else {
         let before_len = crate::track::geo::path_length(&flat);
@@ -272,6 +302,17 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
             (avoided, times)
         }
     };
+
+    // 最后再钉一次终点。
+    //
+    // 上面第 6 步的 `avoid_blockers` 会**插点**（绕楼），插完末点就不再是
+    // 我们 push 进去的终点了——实测偏出去 565m，App 里看就是「没跑到终点」。
+    // 放在这里（所有后处理之后、转 TrackPoint 之前）才真正锁得住。
+    if let Some(e) = req.end {
+        if let Some(last) = flat.last_mut() {
+            *last = e;
+        }
+    }
 
     let points: Vec<TrackPoint> = flat
         .iter()
@@ -414,7 +455,35 @@ mod tests {
             start_ms: 1_730_000_000_000,
             sport_type: 1,
             sample_step_m: 5.0,
+            end: None,
         }
+    }
+
+    /// 指定终点后：轨迹必须收在终点，且总里程仍贴着目标。
+    #[test]
+    fn end_point_is_honored() {
+        let mut req = base_req();
+        let end = (30.5, 104.0 + 400.0 / crate::track::geo::m_per_deg_lng(30.5));
+        req.end = Some(end);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let r = plan(&req, &mut rng).unwrap();
+        let last = *r.points.last().unwrap();
+        let d = crate::track::geo::distance((last.lat, last.lon), end);
+        assert!(d < 15.0, "末点离终点 {d:.1}m（应贴着）");
+        let dev = (r.actual_length_m - req.total_distance_m).abs() / req.total_distance_m;
+        assert!(dev < 0.15, "总里程偏差 {:.1}% 超出容差", dev * 100.0);
+    }
+
+    /// 不给终点时行为不变：最后一圈仍回到起点附近。
+    #[test]
+    fn no_end_keeps_closed_loop() {
+        let req = base_req();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let r = plan(&req, &mut rng).unwrap();
+        let first = r.points[0];
+        let last = *r.points.last().unwrap();
+        let d = crate::track::geo::distance((first.lat, first.lon), (last.lat, last.lon));
+        assert!(d < 120.0, "无终点时首尾应接近（差 {d:.1}m）");
     }
 
     #[test]
@@ -519,7 +588,7 @@ mod corner_smooth_tests {
     fn rect_cps() -> Vec<Checkpoint> {
         // 以 30.5N 为基准，100m 见方
         let dlat = 100.0 / super::super::geo::M_PER_DEG_LAT;
-        let dlng = 100.0 / super::super::geo::m_per_deg_lng(30.5);
+        let dlng = 100.0 / crate::track::geo::m_per_deg_lng(30.5);
         let corners = [
             (30.5, 104.0),
             (30.5, 104.0 + dlng),
@@ -564,6 +633,7 @@ mod corner_smooth_tests {
             start_ms: 1_730_000_000_000,
             sport_type: 1,
             sample_step_m: 5.0,
+            end: None,
         };
         let mut r = rand::rngs::StdRng::seed_from_u64(7);
         let res = plan(&req, &mut r).unwrap();
