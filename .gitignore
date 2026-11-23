@@ -8,3 +8,4 @@ accounts.json
 *.session
 pace-forge-device-id*
 *.tmp
+.DS_Store
