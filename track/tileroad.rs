@@ -970,7 +970,7 @@ pub fn route_through_ex(
             }
             // 别选远超剩余量的点：排除终点区域后候选变少，选太远的一下
             // 就把里程冲过头（实测目标 2000 跑出 2663）。
-            if d > need * 1.2 {
+            if d > need {
                 continue;
             }
             // 选最接近剩余里程的。这里不设偏差上限——路网就这么大，
@@ -983,34 +983,8 @@ pub fn route_through_ex(
             }
         }
         let Some((_, m)) = pick else { break };
-        // 在「够远」的候选里随机挑一个，而不是永远选最接近剩余里程的那个。
-        // 候选必须**接近剩余里程**（±40%），只在够近的那一档里随机——
-        // 早先把「够远」的候选按距离降序取，结果挑到全图最远的节点，2.4km
-        // 的目标跑出 3.6km（实测）。
-        let mut band: Vec<usize> = de
-            .iter()
-            .enumerate()
-            .filter(|(i, d)| {
-                d.is_finite()
-                    && **d >= need * 0.85
-                    && **d <= need * 1.15
-                    && !all_zones.contains(i)
-                    && *i != last
-            })
-            .map(|(i, _)| i)
-            .collect();
-        band.sort_unstable();
-        // 延伸段走「最接近剩余里程」的那个节点（确定性）：路线形状稳定，
-        // 打卡点次序也不会被延伸段扫到。合并上游 v0.1.11 后不再在这里做随机，
-        // 「同一条路、每天差十几米」交给下游横向摆动（`soften`）与
-        // `route_through_seeded` 的折返扰动。
-        let mut near: Vec<(f64, usize)> = band
-            .iter()
-            .map(|i| ((de[*i] - need).abs(), *i))
-            .collect();
-        near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let m = if near.is_empty() { m } else { near.remove(0).1 };
-        let Some(tail) = astar_penalized(g, last, m, &used, 4.0, &HashSet::new()) else {
+        let Some(tail) = astar_penalized(g, last, m, &used, 25.0, &HashSet::new()) else {
+
             break;
         };
         for w in tail.windows(2) {

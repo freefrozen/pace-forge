@@ -1920,6 +1920,24 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             not_passed.join("、")
         ));
     }
+
+    // type=2 的数量必须等于必到点数。
+    //
+    // `isPass` 管成绩（服务端判「经过没有」），`type=2` 管**显示**：App 详情页
+    // 按 type=2 的点位画绿点，少一个就少画一个（issue #11：起点压在打卡点上时
+    // 5 个点只标出 4 个）。两者都得齐，缺 display 那层用户会以为没跑成。
+    let marked = probe_sub
+        .points
+        .iter()
+        .filter(|p| p.get("type").and_then(|v| v.as_i64()) == Some(2))
+        .count();
+    if !fixed.is_empty() && marked < fixed.len() {
+        return Err(format!(
+            "必到点 {} 个，但报文里只有 {marked} 个 type=2 打卡标记：App 详情页会少画 {} 个绿点（成绩不受影响，是显示问题）。\n    成因：起点(type=7) 或起步窗口的灰点(type=-1) 占掉了该点位 10m 内唯一的采样点。\n    处理：把「纬度/经度」锚点挪到离这些点位 20m 以外再跑。",
+            fixed.len(),
+            fixed.len() - marked
+        ));
+    }
     if !fixed.is_empty() && n_fixed != fixed.len() {
         return Err(format!(
             "自检点位里必到点数量对不上（报文 {n_fixed} 个，应有 {} 个）：probe 的 fixed 传空了？",
